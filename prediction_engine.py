@@ -16,24 +16,34 @@ from api_client import (
 )
 from tail_analyzer import (
     analyze_tail_frequency, adjust_probs_by_tail, 
-    calculate_tail_statistics, get_tail_prediction_weights
+    calculate_tail_statistics, get_tail_prediction_weights,
+    get_dynamic_tail_analyzer
 )
 from markov_model import (
     build_markov_2nd_order_matrix, predict_combination,
-    calculate_ema_weights, analyze_markov_performance
+    calculate_ema_weights, analyze_markov_performance,
+    get_dynamic_markov_model
 )
 from data_processor import extract_features as process_features
 from config import redis_client
+from config_constants import get_monitoring_config, get_prediction_config
 
 logger = logging.getLogger(__name__)
 
-# Constants
+# Prediction combination weights
+MARKOV_WEIGHT = 0.7  # 马尔可夫链权重
+TAIL_WEIGHT = 0.3    # 尾数分析权重
+
+# Load configuration constants
+prediction_config = get_prediction_config()
+
+# Constants from configuration
 MARKOV_WEIGHT = 0.7
 TAIL_WEIGHT = 0.3
-HIGH_CONFIDENCE_THRESHOLD = 0.4
-MEDIUM_CONFIDENCE_THRESHOLD = 0.3
-HIGH_ACCURACY_THRESHOLD = 0.65
-MEDIUM_ACCURACY_THRESHOLD = 0.55
+HIGH_CONFIDENCE_THRESHOLD = prediction_config.HIGH_PROB_CONFIDENCE
+MEDIUM_CONFIDENCE_THRESHOLD = prediction_config.MEDIUM_PROB_CONFIDENCE
+HIGH_ACCURACY_THRESHOLD = prediction_config.HIGH_ACCURACY_CONFIDENCE
+MEDIUM_ACCURACY_THRESHOLD = prediction_config.MEDIUM_ACCURACY_CONFIDENCE
 
 @dataclass
 class PredictionConfig:
@@ -65,6 +75,14 @@ class PC28PredictionEngine:
         self.cache_prefix = "pc28_engine:"
         self.accuracy_key = f"{self.cache_prefix}accuracy"
         self.performance_key = f"{self.cache_prefix}performance"
+        
+        # Initialize dynamic tail analyzer (cached for performance)
+        try:
+            self.dynamic_tail_analyzer = get_dynamic_tail_analyzer()
+            logger.info("Dynamic tail analyzer initialized")
+        except Exception as e:
+            logger.warning(f"Failed to initialize dynamic tail analyzer: {e}")
+            self.dynamic_tail_analyzer = None
         
         logger.info(f"PC28 Prediction Engine initialized with config: {self.config}")
     
@@ -212,19 +230,43 @@ class PC28PredictionEngine:
         except Exception as e:
             logger.error(f"Markov prediction failed: {e}")
             # Return uniform distribution
-            uniform_prob = 1.0 / len(self.config.states)
+            uniform_prob = 1.0 / len(self.config.states) if self.config.states else 0.25
             return {state: uniform_prob for state in self.config.states}
     
     def _combine_predictions(self, markov_probs: Dict[str, float], 
                            tail_analysis: Dict[str, Any]) -> Dict[str, float]:
         """Combine Markov and tail analysis predictions"""
         try:
-            # Apply tail frequency adjustments to Markov probabilities
-            adjusted_probs = adjust_probs_by_tail(
-                markov_probs, 
-                tail_analysis['frequencies'], 
-                self.accuracy_history
-            )
+            # Get current accuracy for dynamic adjustment
+            current_accuracy = 0.5  # Default
+            if len(self.accuracy_history) >= 10:
+                recent_count = min(len(self.accuracy_history), 100)
+                current_accuracy = sum(self.accuracy_history[-recent_count:]) / recent_count
+            
+            # Apply dynamic tail frequency adjustments to Markov probabilities
+            if self.dynamic_tail_analyzer:
+                try:
+                    adjusted_probs = self.dynamic_tail_analyzer.adjust_probs_by_tail_dynamic(
+                        markov_probs, 
+                        tail_analysis['frequencies'], 
+                        current_accuracy
+                    )
+                    logger.debug(f"Dynamic tail adjustment applied with accuracy {current_accuracy:.3f}")
+                except Exception as e:
+                    logger.warning(f"Dynamic tail analysis failed, using legacy method: {e}")
+                    # Fallback to original method
+                    adjusted_probs = adjust_probs_by_tail(
+                        markov_probs, 
+                        tail_analysis['frequencies'], 
+                        self.accuracy_history
+                    )
+            else:
+                # Use legacy method if dynamic analyzer not available
+                adjusted_probs = adjust_probs_by_tail(
+                    markov_probs, 
+                    tail_analysis['frequencies'], 
+                    self.accuracy_history
+                )
             
             # Apply tail-based prediction weights
             tail_weights = tail_analysis['prediction_weights']
@@ -263,38 +305,41 @@ class PC28PredictionEngine:
             confidence_factors = []
             
             # Factor 1: Statistical significance of tail analysis
+            prediction_config = get_prediction_config()
             if tail_analysis['is_significant']:
-                confidence_factors.append(0.85)
+                confidence_factors.append(prediction_config.HIGH_CONFIDENCE_FACTOR)
             else:
-                confidence_factors.append(0.50)
+                confidence_factors.append(prediction_config.LOW_CONFIDENCE_FACTOR)
             
             # Factor 2: Prediction probability strength
             if predicted_probability > HIGH_CONFIDENCE_THRESHOLD:
-                confidence_factors.append(0.9)
+                confidence_factors.append(prediction_config.HIGH_PROB_CONFIDENCE)
             elif predicted_probability > MEDIUM_CONFIDENCE_THRESHOLD:
-                confidence_factors.append(0.75)
+                confidence_factors.append(prediction_config.MEDIUM_PROB_CONFIDENCE)
             else:
-                confidence_factors.append(0.6)
+                confidence_factors.append(prediction_config.LOW_PROB_CONFIDENCE)
             
             # Factor 3: Recent accuracy history
-            if len(self.accuracy_history) >= 20:
-                recent_accuracy = sum(self.accuracy_history[-20:]) / 20
+            min_samples = prediction_config.MIN_ACCURACY_SAMPLES
+            if len(self.accuracy_history) >= min_samples:
+                recent_accuracy = sum(self.accuracy_history[-min_samples:]) / min_samples
                 if recent_accuracy > HIGH_ACCURACY_THRESHOLD:
-                    confidence_factors.append(0.9)
+                    confidence_factors.append(prediction_config.HIGH_ACCURACY_CONFIDENCE)
                 elif recent_accuracy > MEDIUM_ACCURACY_THRESHOLD:
-                    confidence_factors.append(0.75)
+                    confidence_factors.append(prediction_config.MEDIUM_ACCURACY_CONFIDENCE)
                 else:
                     confidence_factors.append(0.6)
             else:
                 confidence_factors.append(0.7)  # Default for insufficient history
             
             # Calculate weighted confidence
-            final_confidence = sum(confidence_factors) / len(confidence_factors)
+            final_confidence = sum(confidence_factors) / len(confidence_factors) if confidence_factors else 0.5
             
             # Determine sum range prediction
             sum_range = self._predict_sum_range(probabilities)
             
-            return PredictionResult(
+            # Create prediction result
+            prediction_result = PredictionResult(
                 sum_range=sum_range,
                 combination=predicted_combination,
                 probabilities=probabilities,
@@ -302,8 +347,31 @@ class PC28PredictionEngine:
                 timestamp=datetime.now()
             )
             
+            # Record performance metrics
+            response_time = time.time() - start_time
+            try:
+                from monitor import get_monitor
+                monitor = get_monitor()
+                monitor.monitor_performance(response_time)
+            except Exception as monitor_error:
+                logger.warning(f"Failed to record performance metrics: {monitor_error}")
+            
+            # Cache the prediction
+            self._cache_prediction(prediction_result)
+            
+            logger.info(f"Prediction generated in {response_time:.3f}s: {predicted_combination}")
+            return prediction_result
+            
         except Exception as e:
             logger.error(f"Prediction finalization failed: {e}")
+            # Still record the failed attempt
+            response_time = time.time() - start_time
+            try:
+                from monitor import get_monitor
+                monitor = get_monitor()
+                monitor.monitor_performance(response_time)
+            except Exception:
+                pass
             return self._create_fallback_prediction()
     
     def _predict_sum_range(self, probabilities: Dict[str, float]) -> str:
@@ -321,7 +389,7 @@ class PC28PredictionEngine:
     
     def _create_fallback_prediction(self) -> PredictionResult:
         """Create fallback prediction when main prediction fails"""
-        uniform_prob = 1.0 / len(self.config.states)
+        uniform_prob = 1.0 / len(self.config.states) if self.config.states else 0.25
         probabilities = {state: uniform_prob for state in self.config.states}
         
         return PredictionResult(
@@ -390,6 +458,14 @@ class PC28PredictionEngine:
         else:
             current_accuracy = 0.5  # Default when insufficient data
         
+        # Update dynamic Markov model with accuracy feedback
+        try:
+            dynamic_model = get_dynamic_markov_model()
+            dynamic_model.update_ema_weights(current_accuracy)
+            logger.debug(f"Dynamic EMA alpha updated to: {dynamic_model.ema_alpha:.3f}")
+        except Exception as e:
+            logger.warning(f"Failed to update dynamic Markov model: {e}")
+        
         # Update cached accuracy
         try:
             redis_client.setex(self.accuracy_key, 3600, str(current_accuracy))
@@ -413,7 +489,7 @@ class PC28PredictionEngine:
             
             if len(self.accuracy_history) >= 10:
                 # Overall accuracy
-                metrics['overall_accuracy'] = sum(self.accuracy_history) / len(self.accuracy_history)
+                metrics['overall_accuracy'] = sum(self.accuracy_history) / len(self.accuracy_history) if self.accuracy_history else 0.0
                 
                 # Recent accuracy (last 50 predictions)
                 recent_window = min(50, len(self.accuracy_history))
@@ -430,6 +506,24 @@ class PC28PredictionEngine:
                         metrics['accuracy_trend'] = 'declining'
                     else:
                         metrics['accuracy_trend'] = 'stable'
+            
+            # Add dynamic Markov model optimization stats
+            try:
+                dynamic_model = get_dynamic_markov_model()
+                optimization_stats = dynamic_model.get_optimization_stats()
+                metrics['dynamic_markov'] = optimization_stats
+            except Exception as e:
+                logger.warning(f"Failed to get dynamic Markov stats: {e}")
+                metrics['dynamic_markov'] = {'error': str(e)}
+            
+            # Add dynamic tail analyzer optimization stats
+            try:
+                dynamic_tail_analyzer = get_dynamic_tail_analyzer()
+                tail_stats = dynamic_tail_analyzer.get_tail_optimization_stats()
+                metrics['dynamic_tail'] = tail_stats
+            except Exception as e:
+                logger.warning(f"Failed to get dynamic tail stats: {e}")
+                metrics['dynamic_tail'] = {'error': str(e)}
             
             return metrics
             

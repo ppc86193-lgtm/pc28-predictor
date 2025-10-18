@@ -3,13 +3,15 @@ from collections import Counter
 from scipy.stats import chi2_contingency, chisquare
 from typing import List, Dict, Tuple, Any
 import logging
+from config_constants import get_tail_config
 
 logger = logging.getLogger(__name__)
 
-# Constants for better maintainability
+# Load configuration constants
+tail_config = get_tail_config()
 EXPECTED_TAIL_FREQUENCY = 0.1  # 10% uniform distribution
 SIGNIFICANCE_THRESHOLD = 0.05
-HIGH_FREQUENCY_THRESHOLD = 0.15
+HIGH_FREQUENCY_THRESHOLD = tail_config.HIGH_FREQUENCY_THRESHOLD
 VARIANCE_SCALE_FACTOR = 10
 MIN_SAMPLE_SIZE = 10
 
@@ -24,7 +26,11 @@ def analyze_tail_frequency(features: List[Dict[str, Any]], window: int = 16) -> 
     Returns:
         Tuple of (tail_frequencies, p_value)
     """
-    # Input validation
+    # Enhanced input validation
+    if not isinstance(features, list):
+        raise TypeError("Features must be a list")
+    if not isinstance(window, int):
+        raise TypeError("Window must be an integer")
     if window <= 0:
         raise ValueError("Window size must be positive")
     if window > 1000:
@@ -89,19 +95,172 @@ def analyze_tail_frequency(features: List[Dict[str, Any]], window: int = 16) -> 
     
     return tail_frequencies, p_value
 
+class DynamicTailAnalyzer:
+    """
+    Dynamic Tail Analyzer with adaptive probability adjustments
+    Phase 6 Task 2: Algorithm Optimization
+    """
+    
+    def __init__(self):
+        """Initialize dynamic tail analyzer"""
+        # Load configuration
+        self.config = get_tail_config()
+        
+        self.base_tail_factor = 0.03
+        self.base_hang_factor = 0.02
+        self.base_boost_factor = self.config.BASE_BOOST_FACTOR
+        self.max_boost_factor = self.config.MAX_BOOST_FACTOR
+        self.min_boost_factor = self.config.MIN_BOOST_FACTOR
+        self.target_tails = self.config.TARGET_TAILS.copy()
+        self.accuracy_history = []
+        
+        logger.info("Dynamic Tail Analyzer initialized")
+    
+    def adjust_probs_by_tail_dynamic(self, probs: Dict[str, float], 
+                                   tail_freq: Dict[int, float], 
+                                   accuracy: float) -> Dict[str, float]:
+        """
+        Dynamically adjust prediction probabilities based on tail frequency and accuracy
+        
+        Args:
+            probs: Current probability distribution
+            tail_freq: Tail frequency distribution  
+            accuracy: Current prediction accuracy (0.0-1.0)
+            
+        Returns:
+            Adjusted probability distribution
+        """
+        if not probs or not tail_freq:
+            logger.warning("Empty probabilities or tail frequencies")
+            return probs
+        
+        if not isinstance(accuracy, (int, float)) or not (0.0 <= accuracy <= 1.0):
+            logger.error(f"Invalid accuracy value: {accuracy}")
+            return probs
+        
+        try:
+            adjusted_probs = probs.copy()
+            
+            # Calculate dynamic boost factor based on accuracy
+            if accuracy < self.config.TARGET_ACCURACY_MIN:  # Below target, increase boost
+                boost_factor = min(self.config.HIGH_BOOST_FACTOR, self.max_boost_factor)
+                reduction_factor = self.config.HIGH_REDUCTION_FACTOR
+            elif accuracy > self.config.TARGET_ACCURACY_MAX:  # Above target, decrease boost  
+                boost_factor = max(self.config.LOW_BOOST_FACTOR, self.min_boost_factor)
+                reduction_factor = self.config.LOW_REDUCTION_FACTOR
+            else:  # In target range, moderate boost
+                boost_factor = self.config.BASE_BOOST_FACTOR
+                reduction_factor = self.config.BASE_REDUCTION_FACTOR
+            
+            # Record accuracy for monitoring
+            self.accuracy_history.append(accuracy)
+            if len(self.accuracy_history) > self.config.MAX_HISTORY_SIZE:
+                self.accuracy_history = self.accuracy_history[-self.config.MAX_HISTORY_SIZE:]
+            
+            # Apply tail-based adjustments
+            adjustments_made = []
+            
+            for tail, freq in tail_freq.items():
+                if tail in self.target_tails and freq > HIGH_FREQUENCY_THRESHOLD:
+                    # Boost probabilities for combinations matching high-frequency tails
+                    for comb in adjusted_probs:
+                        if self._tail_matches_combination(tail, comb):
+                            old_prob = adjusted_probs[comb]
+                            adjusted_probs[comb] *= boost_factor
+                            adjustments_made.append(f"{comb}: {old_prob:.3f}→{adjusted_probs[comb]:.3f}")
+                        else:
+                            # Slightly reduce other combinations
+                            adjusted_probs[comb] *= reduction_factor
+            
+            # Normalize probabilities to sum to 1.0
+            total = sum(adjusted_probs.values())
+            if total > 0:
+                adjusted_probs = {k: v / total for k, v in adjusted_probs.items()}
+            else:
+                logger.warning("Total probability is zero, returning uniform distribution")
+                adjusted_probs = {k: 1.0/len(adjusted_probs) for k in adjusted_probs.keys()} if adjusted_probs else {}
+            
+            if adjustments_made:
+                logger.info(f"尾数权重调整 (准确率={accuracy:.3f}, 增强={boost_factor:.3f}): {adjustments_made[:3]}")
+            
+            return adjusted_probs
+            
+        except Exception as e:
+            logger.error(f"Failed to adjust probabilities by tail: {e}")
+            return probs
+    
+    def _tail_matches_combination(self, tail: int, combination: str) -> bool:
+        """
+        Check if a tail digit matches a combination type
+        
+        Args:
+            tail: Tail digit (0-9)
+            combination: Combination string (大单, 小双, etc.)
+            
+        Returns:
+            True if tail matches combination pattern
+        """
+        try:
+            # Tail 7, 9 favor odd combinations (单)
+            if tail in [7, 9] and "单" in combination:
+                return True
+            
+            # Tail 0, 2, 8 favor even combinations (双)  
+            if tail in [0, 2, 8] and "双" in combination:
+                return True
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"Failed to match tail to combination: {e}")
+            return False
+    
+    def get_tail_optimization_stats(self) -> Dict[str, Any]:
+        """
+        Get tail optimization statistics
+        
+        Returns:
+            Dictionary with tail optimization metrics
+        """
+        try:
+            if not self.accuracy_history:
+                return {
+                    "accuracy_samples": 0,
+                    "avg_accuracy": 0.0,
+                    "boost_factor_range": f"{self.min_boost_factor}-{self.max_boost_factor}",
+                    "target_tails": self.target_tails
+                }
+            
+            recent_accuracy = self.accuracy_history[-10:] if len(self.accuracy_history) >= 10 else self.accuracy_history
+            avg_accuracy = sum(recent_accuracy) / len(recent_accuracy) if recent_accuracy else 0.5
+            
+            # Determine current boost factor based on average accuracy
+            if avg_accuracy < self.config.TARGET_ACCURACY_MIN:
+                current_boost = self.config.HIGH_BOOST_FACTOR
+            elif avg_accuracy > self.config.TARGET_ACCURACY_MAX:
+                current_boost = self.config.LOW_BOOST_FACTOR
+            else:
+                current_boost = self.config.BASE_BOOST_FACTOR
+            
+            return {
+                "accuracy_samples": len(self.accuracy_history),
+                "avg_accuracy": round(avg_accuracy, 4),
+                "current_boost_factor": current_boost,
+                "boost_factor_range": f"{self.min_boost_factor}-{self.max_boost_factor}",
+                "target_tails": self.target_tails,
+                "high_freq_threshold": HIGH_FREQUENCY_THRESHOLD
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to get tail optimization stats: {e}")
+            return {"error": str(e)}
+
 def adjust_probs_by_tail(probs: Dict[str, float], 
                         tail_freq: Dict[int, float], 
                         accuracy_history: List[int]) -> Dict[str, float]:
     """
-    Adjust prediction probabilities based on tail frequency analysis
-    
-    Args:
-        probs: Current probability distribution
-        tail_freq: Tail frequency distribution
-        accuracy_history: Recent accuracy history for dynamic adjustment
-        
-    Returns:
-        Adjusted probability distribution
+    Legacy function - maintained for backward compatibility
+    Use DynamicTailAnalyzer.adjust_probs_by_tail_dynamic for new implementations
     """
     if not probs or not tail_freq:
         return probs
@@ -115,11 +274,12 @@ def adjust_probs_by_tail(probs: Dict[str, float],
     base_tail_factor = 0.03
     base_hang_factor = 0.02
     
-    # Dynamic adjustment based on accuracy
-    if recent_accuracy > 0.60:
+    # Dynamic adjustment based on accuracy (using constants)
+    tail_config = get_tail_config()
+    if recent_accuracy > tail_config.TARGET_ACCURACY_MAX:
         tail_factor = 0.04
         hang_factor = 0.025
-    elif recent_accuracy > 0.55:
+    elif recent_accuracy > tail_config.TARGET_ACCURACY_MIN:
         tail_factor = 0.035
         hang_factor = 0.022
     else:
@@ -156,7 +316,7 @@ def adjust_probs_by_tail(probs: Dict[str, float],
     else:
         # Fallback for zero total
         logger.warning("Total probability is zero, returning uniform distribution")
-        adjusted_probs = {k: 1.0/len(adjusted_probs) for k in adjusted_probs.keys()}
+        adjusted_probs = {k: 1.0/len(adjusted_probs) for k in adjusted_probs.keys()} if adjusted_probs else {}
     
     return adjusted_probs
 
@@ -236,3 +396,13 @@ def get_tail_prediction_weights(tail_stats: Dict[str, Any]) -> Dict[str, float]:
         weights = {k: v / total for k, v in weights.items()}
     
     return weights
+
+# Global dynamic tail analyzer instance
+_dynamic_tail_analyzer = None
+
+def get_dynamic_tail_analyzer() -> DynamicTailAnalyzer:
+    """Get singleton dynamic tail analyzer instance"""
+    global _dynamic_tail_analyzer
+    if _dynamic_tail_analyzer is None:
+        _dynamic_tail_analyzer = DynamicTailAnalyzer()
+    return _dynamic_tail_analyzer

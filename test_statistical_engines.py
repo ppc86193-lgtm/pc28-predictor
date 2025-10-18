@@ -21,7 +21,9 @@ from markov_model import (
     calculate_ema_weights,
     calculate_streak_adjustments,
     analyze_markov_performance,
-    optimize_markov_parameters
+    optimize_markov_parameters,
+    DynamicMarkovModel,
+    get_dynamic_markov_model
 )
 
 class TestTailAnalyzer:
@@ -302,6 +304,150 @@ class TestMarkovModel:
         assert "best_accuracy" in result
         assert "all_results" in result
         assert result["optimization_completed"] == True
+
+class TestDynamicMarkovModel:
+    """Test DynamicMarkovModel class"""
+    
+    def test_initialization(self):
+        """Test dynamic model initialization"""
+        model = DynamicMarkovModel(0.4)
+        
+        assert model.ema_alpha == 0.4
+        assert model.min_ema_alpha == 0.1
+        assert model.max_ema_alpha == 0.9
+        assert model.adjustment_step == 0.01
+        assert len(model.accuracy_history) == 0
+        assert len(model.ema_history) == 0
+    
+    def test_initialization_bounds(self):
+        """Test initialization with out-of-bounds values"""
+        # Test too low
+        model_low = DynamicMarkovModel(0.05)
+        assert model_low.ema_alpha == 0.1
+        
+        # Test too high
+        model_high = DynamicMarkovModel(0.95)
+        assert model_high.ema_alpha == 0.9
+    
+    def test_update_ema_weights_below_target(self):
+        """Test EMA weight update when accuracy is below target"""
+        model = DynamicMarkovModel(0.3)
+        initial_alpha = model.ema_alpha
+        
+        # Update with low accuracy
+        model.update_ema_weights(0.50)  # Below 0.56 target
+        
+        assert model.ema_alpha > initial_alpha  # Should increase
+        assert len(model.accuracy_history) == 1
+        assert len(model.ema_history) == 1
+    
+    def test_update_ema_weights_above_target(self):
+        """Test EMA weight update when accuracy is above target"""
+        model = DynamicMarkovModel(0.7)
+        initial_alpha = model.ema_alpha
+        
+        # Update with high accuracy
+        model.update_ema_weights(0.65)  # Above 0.61 target
+        
+        assert model.ema_alpha < initial_alpha  # Should decrease
+        assert len(model.accuracy_history) == 1
+        assert len(model.ema_history) == 1
+    
+    def test_update_ema_weights_in_target_range(self):
+        """Test EMA weight update when accuracy is in target range"""
+        model = DynamicMarkovModel(0.5)
+        initial_alpha = model.ema_alpha
+        
+        # Update with target accuracy
+        model.update_ema_weights(0.58)  # Between 0.56 and 0.61
+        
+        assert model.ema_alpha == initial_alpha  # Should remain unchanged
+        assert len(model.accuracy_history) == 1
+        assert len(model.ema_history) == 1
+    
+    def test_update_ema_weights_invalid_input(self):
+        """Test EMA weight update with invalid input"""
+        model = DynamicMarkovModel(0.3)
+        initial_alpha = model.ema_alpha
+        
+        # Test invalid accuracy values
+        model.update_ema_weights(-0.1)  # Negative
+        model.update_ema_weights(1.5)   # Too high
+        model.update_ema_weights("invalid")  # Wrong type
+        
+        # Alpha should remain unchanged
+        assert model.ema_alpha == initial_alpha
+        assert len(model.accuracy_history) == 0  # No valid updates
+    
+    def test_history_size_limit(self):
+        """Test that history is properly bounded"""
+        model = DynamicMarkovModel(0.3)
+        
+        # Add more than MAX_HISTORY_SIZE entries
+        for i in range(150):
+            model.update_ema_weights(0.5 + (i % 10) * 0.01)
+        
+        # Should be limited to MAX_HISTORY_SIZE
+        assert len(model.accuracy_history) == model.MAX_HISTORY_SIZE
+        assert len(model.ema_history) == model.MAX_HISTORY_SIZE
+    
+    def test_get_dynamic_ema_weights(self):
+        """Test dynamic EMA weight calculation"""
+        model = DynamicMarkovModel(0.4)
+        
+        weights = model.get_dynamic_ema_weights(5)
+        
+        assert len(weights) == 5
+        assert abs(sum(weights) - 1.0) < 1e-10  # Should sum to 1
+        assert all(w >= 0 for w in weights)  # All weights positive
+        assert weights[0] > weights[1] > weights[2]  # Decreasing weights
+    
+    def test_get_dynamic_ema_weights_invalid_periods(self):
+        """Test dynamic EMA weights with invalid periods"""
+        model = DynamicMarkovModel(0.4)
+        
+        # Test with zero and negative periods
+        weights_zero = model.get_dynamic_ema_weights(0)
+        weights_negative = model.get_dynamic_ema_weights(-5)
+        
+        # Should default to 5 periods
+        assert len(weights_zero) == 5
+        assert len(weights_negative) == 5
+    
+    def test_get_optimization_stats_no_data(self):
+        """Test optimization stats with no data"""
+        model = DynamicMarkovModel(0.3)
+        
+        stats = model.get_optimization_stats()
+        
+        assert stats["current_ema_alpha"] == 0.3
+        assert stats["accuracy_samples"] == 0
+        assert stats["avg_accuracy"] == 0.0
+        assert stats["ema_stability"] == "no_data"
+    
+    def test_get_optimization_stats_with_data(self):
+        """Test optimization stats with data"""
+        model = DynamicMarkovModel(0.3)
+        
+        # Add some accuracy data
+        accuracies = [0.55, 0.58, 0.60, 0.57, 0.59]
+        for acc in accuracies:
+            model.update_ema_weights(acc)
+        
+        stats = model.get_optimization_stats()
+        
+        assert stats["accuracy_samples"] == 5
+        assert 0.55 <= stats["avg_accuracy"] <= 0.60
+        assert stats["ema_stability"] in ["stable", "adjusting"]
+        assert "ema_variance" in stats
+        assert "adjustment_range" in stats
+    
+    def test_singleton_pattern(self):
+        """Test singleton pattern for global instance"""
+        model1 = get_dynamic_markov_model()
+        model2 = get_dynamic_markov_model()
+        
+        assert model1 is model2  # Should be the same instance
 
 class TestIntegration:
     """Integration tests for statistical engines"""

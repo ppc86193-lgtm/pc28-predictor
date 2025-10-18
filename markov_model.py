@@ -2,18 +2,174 @@ import numpy as np
 from scipy.sparse import csr_matrix, lil_matrix
 from collections import Counter, defaultdict
 from typing import List, Dict, Tuple, Any, Optional
+from collections import deque
 import logging
+from functools import lru_cache
+from config_constants import get_markov_config
 
 logger = logging.getLogger(__name__)
 
+@lru_cache(maxsize=32)
 def calculate_ema_weights(periods: int = 5) -> np.ndarray:
-    """Calculate exponential moving average weights"""
+    """Calculate exponential moving average weights with caching for performance"""
     if periods <= 0:
         periods = 5
     
-    decay = np.exp(-np.log(2) / periods)
-    weights = np.array([decay ** i for i in range(periods)])
-    return weights / weights.sum()
+    try:
+        decay = np.exp(-np.log(2) / periods)
+        weights = np.array([decay ** i for i in range(periods)])
+        normalized_weights = weights / weights.sum()
+        return normalized_weights
+    except (ValueError, ZeroDivisionError) as e:
+        logger.error(f"Error calculating EMA weights for periods {periods}: {e}")
+        # Return uniform weights as fallback
+        return np.ones(periods) / periods
+
+class DynamicMarkovModel:
+    """
+    Dynamic Markov Model with adaptive EMA weights based on accuracy feedback
+    Phase 6 Task 2: Algorithm Optimization
+    """
+    
+    def __init__(self, initial_ema_alpha: float = None):
+        """
+        Initialize dynamic Markov model
+        
+        Args:
+            initial_ema_alpha: Initial EMA smoothing factor (0.1-0.9), uses config default if None
+        """
+        # Load configuration
+        self.config = get_markov_config()
+        
+        # Set initial EMA alpha
+        if initial_ema_alpha is None:
+            initial_ema_alpha = self.config.INITIAL_EMA_ALPHA
+        
+        self.ema_alpha: float = max(self.config.EMA_ALPHA_MIN, min(self.config.EMA_ALPHA_MAX, initial_ema_alpha))
+        self.min_ema_alpha: float = self.config.EMA_ALPHA_MIN
+        self.max_ema_alpha: float = self.config.EMA_ALPHA_MAX
+        self.adjustment_step: float = self.config.ADJUSTMENT_STEP
+        
+        # Use deque for efficient bounded history management
+        self.accuracy_history: deque = deque(maxlen=self.config.MAX_HISTORY_SIZE)
+        self.ema_history: deque = deque(maxlen=self.config.MAX_HISTORY_SIZE)
+        
+        logger.info(f"Dynamic Markov Model initialized with EMA alpha: {self.ema_alpha}")
+    
+    def update_ema_weights(self, accuracy: float) -> None:
+        """
+        Dynamically adjust EMA weights based on prediction accuracy
+        
+        Args:
+            accuracy: Current prediction accuracy (0.0-1.0)
+        """
+        if not isinstance(accuracy, (int, float)) or not (0.0 <= accuracy <= 1.0):
+            logger.error(f"Invalid accuracy value: {accuracy}")
+            return
+        
+        try:
+            old_alpha = self.ema_alpha
+            
+            # 动态步长：准确率越接近0.5（不确定区域），步长越小，避免过度调整
+            # Dynamic step: smaller adjustments when accuracy is near 0.5 (uncertain region)
+            confidence_factor = abs(accuracy - 0.5) * 2  # Scale 0-0.5 range to 0-1
+            dynamic_step = self.adjustment_step * max(0.1, confidence_factor)  # Minimum 10% of base step
+            
+            # Adjust EMA alpha based on accuracy thresholds
+            if accuracy < self.config.TARGET_ACCURACY_MIN:  # Below target, increase responsiveness
+                self.ema_alpha = min(self.ema_alpha + dynamic_step, self.max_ema_alpha)
+            elif accuracy > self.config.TARGET_ACCURACY_MAX:  # Above target, decrease responsiveness
+                self.ema_alpha = max(self.ema_alpha - dynamic_step, self.min_ema_alpha)
+            # If TARGET_ACCURACY_MIN <= accuracy <= TARGET_ACCURACY_MAX, keep current alpha (optimal range)
+            
+            # Record history for analysis (deque automatically handles size limit)
+            self.accuracy_history.append(accuracy)
+            self.ema_history.append(self.ema_alpha)
+            
+            if abs(self.ema_alpha - old_alpha) > self.config.SIGNIFICANT_CHANGE_THRESHOLD:  # Only log significant changes
+                logger.info(f"EMA权重调整: {old_alpha:.3f} → {self.ema_alpha:.3f} (准确率: {accuracy:.3f}, 步长: {dynamic_step:.4f})")
+            
+        except Exception as e:
+            logger.error(f"Failed to update EMA weights: {e}")
+    
+    def get_dynamic_ema_weights(self, periods: int = 5) -> np.ndarray:
+        """
+        Calculate EMA weights using current dynamic alpha
+        
+        Args:
+            periods: Number of periods for EMA calculation
+            
+        Returns:
+            Dynamic EMA weights array
+        """
+        try:
+            if periods <= 0:
+                periods = 5
+            
+            # Use alpha to modify the standard EMA decay calculation
+            base_decay = np.exp(-np.log(2) / periods)
+            adjusted_decay = base_decay * self.ema_alpha  # Apply alpha as a modifier
+            
+            weights = np.array([adjusted_decay ** i for i in range(periods)])
+            normalized_weights = weights / weights.sum()
+            
+            logger.debug(f"Dynamic EMA weights (α={self.ema_alpha:.3f}): {normalized_weights}")
+            return normalized_weights
+            
+        except Exception as e:
+            logger.error(f"Failed to calculate dynamic EMA weights: {e}")
+            # Fallback to standard calculation
+            return calculate_ema_weights(periods)
+    
+    def get_optimization_stats(self) -> Dict[str, Any]:
+        """
+        Get optimization statistics for monitoring
+        
+        Returns:
+            Dictionary with optimization metrics
+        """
+        try:
+            if not self.accuracy_history:
+                return {
+                    "current_ema_alpha": self.ema_alpha,
+                    "accuracy_samples": 0,
+                    "avg_accuracy": 0.0,
+                    "ema_stability": "no_data"
+                }
+            
+            # Get recent accuracy data (deque supports negative indexing)
+            recent_window = min(self.config.RECENT_STATS_WINDOW, len(self.accuracy_history))
+            recent_accuracy = list(self.accuracy_history)[-recent_window:] if recent_window > 0 else []
+            avg_accuracy = sum(recent_accuracy) / len(recent_accuracy) if recent_accuracy else 0.0
+            
+            # Calculate EMA stability (variance in recent adjustments)
+            recent_ema = list(self.ema_history)[-recent_window:] if recent_window > 0 else []
+            ema_variance = np.var(recent_ema) if len(recent_ema) > 1 else 0.0
+            
+            stability = "stable" if ema_variance < self.config.STABILITY_VARIANCE_THRESHOLD else "adjusting"
+            
+            return {
+                "current_ema_alpha": round(self.ema_alpha, 4),
+                "accuracy_samples": len(self.accuracy_history),
+                "avg_accuracy": round(avg_accuracy, 4),
+                "ema_stability": stability,
+                "ema_variance": round(ema_variance, 6),
+                "adjustment_range": f"{self.min_ema_alpha}-{self.max_ema_alpha}"
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to get optimization stats: {e}")
+            return {"error": str(e)}
+
+# Global dynamic model instance
+_dynamic_model = None
+
+def get_dynamic_markov_model() -> DynamicMarkovModel:
+    """Get singleton dynamic Markov model instance"""
+    global _dynamic_model
+    if _dynamic_model is None:
+        _dynamic_model = DynamicMarkovModel()
+    return _dynamic_model
 
 def build_markov_2nd_order_matrix(features: List[Dict[str, Any]], 
                                  states: List[str] = ["大单", "小双", "小单", "大双", "极值"], 
@@ -120,7 +276,7 @@ def predict_combination(features: List[Dict[str, Any]],
     """
     if len(features) < 2:
         logger.warning("Insufficient data for second-order prediction")
-        return {state: 1.0 / len(states) for state in states}
+        return {state: 1.0 / len(states) for state in states} if states else {}
     
     # Extract recent combinations
     recent_combinations = []
@@ -130,8 +286,10 @@ def predict_combination(features: List[Dict[str, Any]],
         elif hasattr(feature, 'combination'):
             recent_combinations.append(feature.combination)
         else:
-            logger.warning(f"Invalid feature format: {feature}")
-            return {state: 1.0 / len(states) for state in states}
+            logger.error(f"Invalid feature format: {feature}")
+            # Return uniform distribution as fallback
+            uniform_prob = 1.0 / len(states) if states else 0.0
+            return {state: uniform_prob for state in states} if states else {}
     
     current_pair = (recent_combinations[0], recent_combinations[1])
     
@@ -181,15 +339,19 @@ def predict_combination(features: List[Dict[str, Any]],
         else:
             last_sum = 14
         
-        # Adjust for extreme values
+        # Adjust for extreme values with proper probability redistribution
         if last_sum <= 5 or last_sum >= 22:
             extreme_factor = 0.05 if recent_accuracy > 0.55 else 0.03
             if "极值" in probs:
-                probs["极值"] += extreme_factor
-                # Redistribute from other states
-                for state in states:
-                    if state != "极值":
-                        probs[state] -= extreme_factor / (len(states) - 1)
+                # Calculate redistribution amount
+                other_states = [s for s in states if s != "极值"]
+                if other_states:
+                    reduction_per_state = extreme_factor / len(other_states)
+                    
+                    # Apply adjustments
+                    probs["极值"] += extreme_factor
+                    for state in other_states:
+                        probs[state] = max(0, probs[state] - reduction_per_state)
     
     # Normalize probabilities
     total = sum(probs.values())
@@ -204,7 +366,8 @@ def calculate_streak_adjustments(last_three: List[str], accuracy: float) -> Dict
     
     # Base adjustment factors
     base_factor = 0.02
-    if accuracy > 0.60:
+    markov_config = get_markov_config()
+    if accuracy > markov_config.TARGET_ACCURACY_MAX:
         streak_factor = 0.025
     elif accuracy > 0.55:
         streak_factor = 0.022

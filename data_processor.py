@@ -46,17 +46,21 @@ def extract_features(data: Dict[str, Any], cache_key: str = None) -> List[PC28Da
             if not numbers or len(numbers) != 3:
                 continue
                 
+            # Validate numbers are non-negative
+            if any(n < 0 for n in numbers):
+                continue
+                
             sum_value = sum(numbers)
             if not (0 <= sum_value <= 27):
                 continue
                 
-            # Determine combination type efficiently
+            # Determine combination type with clear boundaries
             if sum_value <= 5 or sum_value >= 22:  # 0-5 极小, 22-27 极大
                 combination = "极值"
-            else:
-                size = "大" if sum_value >= 14 else "小"
-                parity = "单" if sum_value % 2 else "双"
-                combination = size + parity
+            elif sum_value <= 13:  # 6-13为小
+                combination = "小单" if sum_value % 2 else "小双"
+            else:  # 14-21为大
+                combination = "大单" if sum_value % 2 else "大双"
             
             pc28_data = PC28Data(
                 sum=sum_value,

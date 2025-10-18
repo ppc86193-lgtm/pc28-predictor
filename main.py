@@ -1,4 +1,5 @@
-from fastapi import FastAPI, HTTPException, Request, Query
+from fastapi import FastAPI, HTTPException, Request, Query, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 import uvicorn
 import json
@@ -15,6 +16,20 @@ from data_processor import extract_features, translate_combination, get_cache_st
 from prediction_engine import get_prediction_engine, PredictionConfig
 from monitor import get_monitor
 from optimizer import get_optimizer
+from markov_model import get_dynamic_markov_model
+from tail_analyzer import get_dynamic_tail_analyzer
+from prometheus_client import Counter, Histogram, Gauge, generate_latest
+from config_constants import get_prometheus_config, get_system_config
+import psutil
+
+# Prometheus metrics - using configuration constants
+prometheus_config = get_prometheus_config()
+predict_requests = Counter(prometheus_config.PREDICT_REQUESTS_METRIC, "Total prediction requests", ["endpoint", "method"])
+predict_duration = Histogram(prometheus_config.PREDICT_DURATION_METRIC, "Prediction duration", ["endpoint"])
+cpu_usage = Gauge(prometheus_config.CPU_USAGE_METRIC, "CPU usage percentage")
+memory_usage = Gauge(prometheus_config.MEMORY_USAGE_METRIC, "Memory usage in MB")
+system_uptime = Gauge(prometheus_config.SYSTEM_UPTIME_METRIC, "System uptime in seconds")
+active_connections = Gauge(prometheus_config.ACTIVE_CONNECTIONS_METRIC, "Number of active connections")
 
 # Request/Response Models
 class AccuracyUpdateRequest(BaseModel):
@@ -42,6 +57,15 @@ async def add_security_headers(request: Request, call_next):
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["X-XSS-Protection"] = "1; mode=block"
     return response
+
+# Global exception handler
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.error(f"Unhandled exception in {request.url}: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content={"error": "Internal server error", "detail": "An unexpected error occurred"}
+    )
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -129,9 +153,10 @@ async def root(request: Request):
             "endpoints": [
                 "/health", "/predict", "/models", "/data/realtime", "/data/history", 
                 "/stats", "/performance", "/monitor/accuracy", "/monitor/performance", 
-                "/monitor/history", "/optimize/analyze", "/optimize/run"
+                "/monitor/history", "/optimize/analyze", "/optimize/run",
+                "/markov/dynamic", "/markov/dynamic/update"
             ],
-            "note": "Monitoring and optimization system integrated with real-time performance tracking"
+            "note": "Monitoring and optimization system with dynamic Markov and tail analysis integration"
         }
     else:
         return {
@@ -141,9 +166,10 @@ async def root(request: Request):
             "endpoints": [
                 "/health", "/predict", "/models", "/data/realtime", "/data/history", 
                 "/stats", "/performance", "/monitor/accuracy", "/monitor/performance", 
-                "/monitor/history", "/optimize/analyze", "/optimize/run"
+                "/monitor/history", "/optimize/analyze", "/optimize/run",
+                "/markov/dynamic", "/markov/dynamic/update"
             ],
-            "note": "监控和优化系统已集成，支持实时性能跟踪和参数调优"
+            "note": "监控和优化系统已集成，支持动态马尔可夫模型和尾数分析优化"
         }
 
 @app.get("/models")
@@ -267,11 +293,16 @@ async def generate_prediction(request: Request):
     start_time = time.time()
     
     try:
+        # Record request
+        predict_requests.labels(endpoint="predict", method="POST").inc()
+        
         # Generate prediction
         prediction = prediction_engine.generate_prediction()
         
-        # Calculate response time
-        response_time_ms = (time.time() - start_time) * 1000
+        # Calculate and record response time
+        response_time = time.time() - start_time
+        response_time_ms = response_time * 1000
+        predict_duration.labels(endpoint="predict").observe(response_time)
         
         # Record prediction for monitoring
         monitor = get_monitor()
@@ -813,6 +844,194 @@ async def get_optimization_history(
         error_msg = f"History failed: {e}" if lang.startswith("en") else f"历史记录获取失败: {e}"
         raise HTTPException(status_code=500, detail=error_msg)
 
+@app.get("/markov/dynamic")
+async def get_dynamic_markov_stats(request: Request):
+    """Get dynamic Markov model optimization statistics"""
+    lang = get_language(request)
+    
+    try:
+        dynamic_model = get_dynamic_markov_model()
+        stats = dynamic_model.get_optimization_stats()
+        
+        # Get current dynamic EMA weights for demonstration
+        current_weights = dynamic_model.get_dynamic_ema_weights(5)
+        stats["current_ema_weights"] = {
+            f"period_{i+1}": round(weight, 4) 
+            for i, weight in enumerate(current_weights)
+        }
+        
+        if lang.startswith("en"):
+            return {
+                "status": "success",
+                "dynamic_markov_stats": stats,
+                "message": f"Dynamic Markov model stats (α={stats.get('current_ema_alpha', 0.3):.3f})"
+            }
+        else:
+            return {
+                "status": "成功",
+                "dynamic_markov_stats": stats,
+                "message": f"动态马尔可夫模型统计 (α={stats.get('current_ema_alpha', 0.3):.3f})"
+            }
+            
+    except Exception as e:
+        logger.error(f"Failed to get dynamic Markov stats: {e}")
+        error_msg = f"Dynamic Markov stats failed: {e}" if lang.startswith("en") else f"动态马尔可夫统计失败: {e}"
+        raise HTTPException(status_code=500, detail=error_msg)
+
+@app.post("/markov/dynamic/update")
+async def update_dynamic_markov(
+    accuracy: float = Query(..., ge=0.0, le=1.0, description="Accuracy value (0.0-1.0)"),
+    request: Request = None
+):
+    """Manually update dynamic Markov model with accuracy feedback"""
+    lang = get_language(request)
+    
+    try:
+        dynamic_model = get_dynamic_markov_model()
+        old_alpha = dynamic_model.ema_alpha
+        
+        dynamic_model.update_ema_weights(accuracy)
+        new_alpha = dynamic_model.ema_alpha
+        
+        change = new_alpha - old_alpha
+        
+        if lang.startswith("en"):
+            return {
+                "status": "success",
+                "message": f"Dynamic Markov model updated with accuracy {accuracy:.3f}",
+                "alpha_change": {
+                    "old_alpha": round(old_alpha, 4),
+                    "new_alpha": round(new_alpha, 4),
+                    "change": round(change, 4)
+                }
+            }
+        else:
+            return {
+                "status": "成功",
+                "message": f"动态马尔可夫模型已更新，准确率 {accuracy:.3f}",
+                "alpha_change": {
+                    "old_alpha": round(old_alpha, 4),
+                    "new_alpha": round(new_alpha, 4),
+                    "change": round(change, 4)
+                }
+            }
+            
+    except Exception as e:
+        logger.error(f"Failed to update dynamic Markov model: {e}")
+        error_msg = f"Dynamic Markov update failed: {e}" if lang.startswith("en") else f"动态马尔可夫更新失败: {e}"
+        raise HTTPException(status_code=500, detail=error_msg)
+
+@app.get("/tail/dynamic")
+async def get_dynamic_tail_stats(request: Request):
+    """Get dynamic tail analyzer optimization statistics"""
+    lang = get_language(request)
+    
+    try:
+        dynamic_tail_analyzer = get_dynamic_tail_analyzer()
+        stats = dynamic_tail_analyzer.get_tail_optimization_stats()
+        
+        if lang.startswith("en"):
+            return {
+                "status": "success",
+                "dynamic_tail_stats": stats,
+                "message": f"Dynamic tail analyzer stats (boost: {stats.get('current_boost_factor', get_tail_config().BASE_BOOST_FACTOR):.3f})"
+            }
+        else:
+            return {
+                "status": "成功",
+                "dynamic_tail_stats": stats,
+                "message": f"动态尾数分析器统计 (增强: {stats.get('current_boost_factor', get_tail_config().BASE_BOOST_FACTOR):.3f})"
+            }
+            
+    except Exception as e:
+        logger.error(f"Failed to get dynamic tail stats: {e}")
+        error_msg = f"Dynamic tail stats failed: {e}" if lang.startswith("en") else f"动态尾数统计失败: {e}"
+        raise HTTPException(status_code=500, detail=error_msg)
+
+@app.post("/tail/dynamic/update")
+async def update_dynamic_tail(
+    accuracy: float = Query(..., ge=0.0, le=1.0, description="Accuracy value (0.0-1.0)"),
+    request: Request = None
+):
+    """Manually update dynamic tail analyzer with accuracy feedback"""
+    lang = get_language(request)
+    
+    try:
+        dynamic_tail_analyzer = get_dynamic_tail_analyzer()
+        
+        # Get test data from configuration
+        from config_constants import get_test_config
+        test_config = get_test_config()
+        test_tail_freq = test_config.DEFAULT_TAIL_FREQUENCIES
+        test_probs = test_config.DEFAULT_STATE_PROBABILITIES
+        
+        # Apply dynamic adjustment
+        adjusted_probs = dynamic_tail_analyzer.adjust_probs_by_tail_dynamic(
+            test_probs, test_tail_freq, accuracy
+        )
+        
+        # Calculate adjustment magnitude
+        max_change = max(abs(adjusted_probs[k] - test_probs[k]) for k in test_probs.keys())
+        
+        if lang.startswith("en"):
+            return {
+                "status": "success",
+                "message": f"Dynamic tail analyzer updated with accuracy {accuracy:.3f}",
+                "adjustment_result": {
+                    "original_probs": test_probs,
+                    "adjusted_probs": {k: round(v, 4) for k, v in adjusted_probs.items()},
+                    "max_change": round(max_change, 4)
+                }
+            }
+        else:
+            return {
+                "status": "成功",
+                "message": f"动态尾数分析器已更新，准确率 {accuracy:.3f}",
+                "adjustment_result": {
+                    "original_probs": test_probs,
+                    "adjusted_probs": {k: round(v, 4) for k, v in adjusted_probs.items()},
+                    "max_change": round(max_change, 4)
+                }
+            }
+            
+    except Exception as e:
+        logger.error(f"Failed to update dynamic tail analyzer: {e}")
+        error_msg = f"Dynamic tail update failed: {e}" if lang.startswith("en") else f"动态尾数更新失败: {e}"
+        raise HTTPException(status_code=500, detail=error_msg)
+
+@app.get("/metrics")
+async def metrics():
+    """Prometheus metrics endpoint"""
+    try:
+        # Load configuration
+        prometheus_config = get_prometheus_config()
+        
+        # Update system metrics
+        cpu_usage.set(psutil.cpu_percent(interval=prometheus_config.CPU_SAMPLE_INTERVAL))
+        memory_info = psutil.virtual_memory()
+        memory_usage.set(memory_info.used / prometheus_config.MEMORY_UNIT_DIVISOR)  # Convert to MB
+        
+        # Update system uptime
+        boot_time = psutil.boot_time()
+        uptime = time.time() - boot_time
+        system_uptime.set(uptime)
+        
+        # Update active connections (approximate)
+        try:
+            connections = len(psutil.net_connections())
+            active_connections.set(connections)
+        except (psutil.AccessDenied, psutil.NoSuchProcess):
+            # Fallback if permission denied
+            active_connections.set(0)
+        
+        return Response(content=generate_latest(), media_type="text/plain")
+        
+    except Exception as e:
+        logger.error(f"Failed to generate metrics: {e}")
+        # Return basic metrics even if some fail
+        return Response(content=generate_latest(), media_type="text/plain")
+
 if __name__ == "__main__":
-    logger.info("Starting PC28 Prediction System - Phase 5")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    system_config = get_system_config()
+    logger.info("Starting PC28 Prediction System - Phase 6")
+    uvicorn.run(app, host=system_config.DEFAULT_HOST, port=system_config.DEFAULT_PORT)

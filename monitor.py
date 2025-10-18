@@ -14,8 +14,38 @@ import statistics
 
 from config import redis_client
 from api_client import fetch_realtime_data
+from prometheus_client import Counter, Histogram, Gauge
+import psutil
+from config_constants import get_health_config, get_monitoring_config, get_monitoring_metrics_config
 
 logger = logging.getLogger(__name__)
+
+def safe_divide(numerator: Union[int, float], denominator: Union[int, float], default: float = 0.0) -> float:
+    """安全除法，避免除零错误
+    
+    Args:
+        numerator: 分子
+        denominator: 分母
+        default: 当除法失败时返回的默认值
+        
+    Returns:
+        除法结果或默认值
+    """
+    try:
+        if denominator == 0:
+            return default
+        return float(numerator) / float(denominator)
+    except (ZeroDivisionError, TypeError, ValueError) as e:
+        logger.warning(f"Safe divide operation failed - numerator: {numerator}, denominator: {denominator}, error: {e}, returning default: {default}")
+        return default
+
+# Prometheus metrics for monitoring - using configuration
+metrics_config = get_monitoring_metrics_config()
+monitor_requests = Counter(metrics_config.MONITOR_REQUESTS_METRIC, "Total monitoring requests", ["operation"])
+monitor_duration = Histogram(metrics_config.MONITOR_DURATION_METRIC, "Monitoring operation duration", ["operation"])
+accuracy_gauge = Gauge(metrics_config.ACCURACY_GAUGE_METRIC, "Current prediction accuracy", ["type"])
+response_time_gauge = Gauge(metrics_config.RESPONSE_TIME_GAUGE_METRIC, "Response time in milliseconds", ["percentile"])
+system_health_gauge = Gauge(metrics_config.SYSTEM_HEALTH_GAUGE_METRIC, "Overall system health score")
 
 # Constants
 DEFAULT_CACHE_TTL = 3600  # 1 hour
@@ -28,7 +58,7 @@ TREND_THRESHOLD = 0.05
 # Alert and trend analysis constants
 MAX_TREND_DAYS = 30
 MIN_TREND_DAYS = 1
-LOW_ACCURACY_THRESHOLD = 0.50
+# LOW_ACCURACY_THRESHOLD moved to config - use get_monitoring_config().LOW_ACCURACY_THRESHOLD
 TREND_COMPARISON_THRESHOLD = 0.05
 MAX_ALERTS_STORED = 100
 ALERT_RETENTION_DAYS = 7
@@ -258,9 +288,9 @@ class PC28Monitor:
             
             # 创建准确率指标
             metrics = AccuracyMetrics(
-                combination_accuracy=combination_correct / total_predictions if total_predictions > 0 else 0.0,
-                sum_range_accuracy=sum_range_correct / total_predictions if total_predictions > 0 else 0.0,
-                overall_accuracy=overall_correct / total_predictions if total_predictions > 0 else 0.0,
+                combination_accuracy=safe_divide(combination_correct, total_predictions),
+                sum_range_accuracy=safe_divide(sum_range_correct, total_predictions),
+                overall_accuracy=safe_divide(overall_correct, total_predictions),
                 total_predictions=total_predictions,
                 correct_predictions=overall_correct,
                 time_period="24h"
@@ -359,9 +389,9 @@ class PC28Monitor:
             overall_correct = sum(1 for r in recent_records if r.is_correct)
             
             return {
-                "combination_accuracy": combination_correct / total,
-                "sum_range_accuracy": sum_range_correct / total,
-                "overall_accuracy": overall_correct / total,
+                "combination_accuracy": safe_divide(combination_correct, total),
+                "sum_range_accuracy": safe_divide(sum_range_correct, total),
+                "overall_accuracy": safe_divide(overall_correct, total),
                 "total_predictions": total,
                 "correct_predictions": overall_correct,
                 "time_period": time_period
@@ -372,13 +402,17 @@ class PC28Monitor:
             return {"error": str(e)}
     
     def get_performance_metrics(self) -> Dict[str, Any]:
-        """获取性能指标"""
+        """获取性能指标并更新Prometheus指标"""
+        start_time = time.time()
+        monitor_requests.labels(operation="get_performance_metrics").inc()
+        
         try:
             metrics = {
                 "response_time": {
                     "avg_ms": 0.0,
                     "min_ms": 0.0,
                     "max_ms": 0.0,
+                    "p50_ms": 0.0,
                     "p95_ms": 0.0,
                     "p99_ms": 0.0
                 },
@@ -392,7 +426,9 @@ class PC28Monitor:
                 },
                 "system": {
                     "redis_connected": False,
-                    "cache_hit_rate": 0.0
+                    "cache_hit_rate": 0.0,
+                    "cpu_usage": 0.0,
+                    "memory_usage_mb": 0.0
                 }
             }
             
@@ -403,21 +439,41 @@ class PC28Monitor:
                 metrics["response_time"]["min_ms"] = min(response_times_list)
                 metrics["response_time"]["max_ms"] = max(response_times_list)
                 
-                # 计算百分位数
+                # 计算百分位数 (使用配置化值)
                 sorted_times = sorted(response_times_list)
                 n = len(sorted_times)
-                metrics["response_time"]["p95_ms"] = sorted_times[int(n * 0.95)] if n > 0 else 0.0
-                metrics["response_time"]["p99_ms"] = sorted_times[int(n * 0.99)] if n > 0 else 0.0
+                monitoring_config = get_monitoring_config()
+                metrics["response_time"]["p50_ms"] = sorted_times[int(n * monitoring_config.PERCENTILE_50)] if n > 0 else 0.0
+                metrics["response_time"]["p95_ms"] = sorted_times[int(n * monitoring_config.PERCENTILE_95)] if n > 0 else 0.0
+                metrics["response_time"]["p99_ms"] = sorted_times[int(n * monitoring_config.PERCENTILE_99)] if n > 0 else 0.0
+                
+                # 更新Prometheus指标
+                response_time_gauge.labels(percentile="p50").set(metrics["response_time"]["p50_ms"])
+                response_time_gauge.labels(percentile="p95").set(metrics["response_time"]["p95_ms"])
+                response_time_gauge.labels(percentile="p99").set(metrics["response_time"]["p99_ms"])
+            
+            # 系统资源监控
+            try:
+                cpu_percent = psutil.cpu_percent(interval=get_prometheus_config().CPU_SAMPLE_INTERVAL)
+                memory_info = psutil.virtual_memory()
+                memory_mb = safe_divide(memory_info.used, 1024 * 1024, 0.0)
+                
+                metrics["system"]["cpu_usage"] = cpu_percent
+                metrics["system"]["memory_usage_mb"] = memory_mb
+            except Exception as e:
+                logger.warning(f"Failed to get system metrics: {e}")
+                metrics["system"]["cpu_usage"] = 0.0
+                metrics["system"]["memory_usage_mb"] = 0.0
             
             # 准确率统计
             if self.accuracy_window:
-                current_accuracy = sum(self.accuracy_window) / len(self.accuracy_window)
+                current_accuracy = safe_divide(sum(self.accuracy_window), len(self.accuracy_window), 0.0)
                 metrics["accuracy"]["current_window"] = current_accuracy
                 
                 # 计算趋势
                 if len(self.accuracy_window) >= 20:
-                    first_half = sum(list(self.accuracy_window)[:10]) / 10
-                    second_half = sum(list(self.accuracy_window)[-10:]) / 10
+                    first_half = safe_divide(sum(list(self.accuracy_window)[:10]), 10, 0.0)
+                    second_half = safe_divide(sum(list(self.accuracy_window)[-10:]), 10, 0.0)
                     
                     if second_half > first_half + TREND_THRESHOLD:
                         metrics["accuracy"]["trend"] = "improving"
@@ -430,14 +486,76 @@ class PC28Monitor:
             try:
                 redis_client.ping()
                 metrics["system"]["redis_connected"] = True
-            except:
+            except Exception:
                 metrics["system"]["redis_connected"] = False
+            
+            # 记录监控操作耗时
+            duration = time.time() - start_time
+            monitor_duration.labels(operation="get_performance_metrics").observe(duration)
             
             return metrics
             
         except Exception as e:
             logger.error(f"Failed to get performance metrics: {e}")
+            duration = time.time() - start_time
+            monitor_duration.labels(operation="get_performance_metrics").observe(duration)
             return {"error": str(e)}
+    
+    def monitor_performance(self, response_time: float, cpu_usage: float = None, memory_usage: float = None) -> None:
+        """记录性能指标到Prometheus"""
+        try:
+            # Load configuration
+            health_config = get_health_config()
+            monitoring_config = get_monitoring_config()
+            
+            # 记录响应时间
+            self.response_times.append(response_time * 1000)  # Convert to ms
+            
+            # 更新Prometheus指标
+            if cpu_usage is not None:
+                # CPU使用率已在其他地方更新，这里可以记录特定操作的CPU使用
+                pass
+            
+            if memory_usage is not None:
+                # 内存使用已在其他地方更新
+                pass
+            
+            # 计算系统健康分数 (0-100)
+            health_score = health_config.BASE_SCORE
+            
+            # 基于响应时间调整健康分数
+            if response_time > health_config.RESPONSE_TIME_CRITICAL:
+                health_score -= health_config.PENALTY_CRITICAL
+            elif response_time > health_config.RESPONSE_TIME_SLOW:
+                health_score -= health_config.PENALTY_SLOW
+            elif response_time > health_config.RESPONSE_TIME_MODERATE:
+                health_score -= health_config.PENALTY_MODERATE
+            
+            # 基于准确率调整健康分数
+            try:
+                accuracy_data = self.get_accuracy_metrics("24h")
+                if "error" not in accuracy_data:
+                    combo_accuracy = accuracy_data.get("combination_accuracy", 0.5)
+                    if combo_accuracy < health_config.ACCURACY_POOR:
+                        health_score -= health_config.ACCURACY_PENALTY_POOR
+                    elif combo_accuracy < health_config.ACCURACY_LOW:
+                        health_score -= health_config.ACCURACY_PENALTY_LOW
+                    
+                    # 更新准确率Prometheus指标
+                    accuracy_gauge.labels(type="combination").set(combo_accuracy)
+                    accuracy_gauge.labels(type="big_small").set(accuracy_data.get("big_small_accuracy", 0.5))
+                    accuracy_gauge.labels(type="sum_range").set(accuracy_data.get("sum_range_accuracy", 0.5))
+            except Exception as e:
+                logger.warning(f"Failed to update accuracy metrics: {e}")
+                health_score -= health_config.ACCURACY_PENALTY_ERROR
+            
+            # 更新系统健康分数
+            system_health_gauge.set(max(0, health_score))
+            
+            logger.debug(f"性能监控：响应时间={response_time:.3f}s, 健康分数={health_score:.1f}")
+            
+        except Exception as e:
+            logger.error(f"记录性能指标失败：{e}")
     
     def get_prediction_history(self, limit: int = 100) -> List[Dict[str, Any]]:
         """获取预测历史记录"""
@@ -529,7 +647,7 @@ class PC28Monitor:
             trend_data = []
             for date_str in sorted(daily_stats.keys())[-days:]:
                 stats = daily_stats[date_str]
-                accuracy = stats["correct"] / stats["total"] if stats["total"] > 0 else 0.0
+                accuracy = safe_divide(stats["correct"], stats["total"])
                 trend_data.append({
                     "date": date_str,
                     "accuracy": round(accuracy, 4),
@@ -543,7 +661,7 @@ class PC28Monitor:
             # 计算总体统计
             total_correct = sum(d["correct_predictions"] for d in trend_data)
             total_predictions = sum(d["total_predictions"] for d in trend_data)
-            avg_accuracy = total_correct / total_predictions if total_predictions > 0 else 0.0
+            avg_accuracy = safe_divide(total_correct, total_predictions)
             
             result = {
                 "trend": trend_data,
@@ -565,10 +683,11 @@ class PC28Monitor:
             })
             
             # 触发低准确率警报
-            if avg_accuracy < LOW_ACCURACY_THRESHOLD:
+            low_threshold = get_monitoring_config().LOW_ACCURACY_THRESHOLD
+            if avg_accuracy < low_threshold:
                 self.trigger_alert("low_accuracy", {
                     "accuracy": avg_accuracy,
-                    "threshold": LOW_ACCURACY_THRESHOLD,
+                    "threshold": low_threshold,
                     "days": days
                 })
             
@@ -595,8 +714,8 @@ class PC28Monitor:
         # 方法1: 对比前后期平均值（优先使用）
         if len(trend_data) >= 4:  # 至少4个数据点
             mid_point = len(trend_data) // 2
-            recent_avg = sum(d["accuracy"] for d in trend_data[mid_point:]) / len(trend_data[mid_point:])
-            earlier_avg = sum(d["accuracy"] for d in trend_data[:mid_point]) / mid_point
+            recent_avg = safe_divide(sum(d["accuracy"] for d in trend_data[mid_point:]), len(trend_data[mid_point:]), 0.5)
+            earlier_avg = safe_divide(sum(d["accuracy"] for d in trend_data[:mid_point]), mid_point, 0.5)
             
             delta = recent_avg - earlier_avg
             if abs(delta) > 0.05:  # 5%阈值，更明显的趋势
@@ -681,7 +800,7 @@ class PC28Monitor:
             accuracy = data.get("accuracy", 1.0)
             if accuracy < 0.40:
                 return "error"
-            elif accuracy < LOW_ACCURACY_THRESHOLD:
+            elif accuracy < get_monitoring_config().LOW_ACCURACY_THRESHOLD:
                 return "warning"
         elif alert_type == "trend":
             direction = data.get("direction", "stable")
@@ -734,7 +853,12 @@ class PC28Monitor:
         
         for attempt in range(max_retries):
             try:
-                time.sleep(2 ** attempt)  # 指数退避: 2, 4, 8秒
+                # 使用配置化的指数退避
+                delay = min(
+                    get_monitoring_config().WEBHOOK_RETRY_BASE_DELAY ** attempt,
+                    get_monitoring_config().WEBHOOK_MAX_DELAY
+                )
+                time.sleep(delay)
                 response = requests.post(webhook_url, json=alert, timeout=5)
                 response.raise_for_status()
                 logger.info(f"Webhook重试成功 (第{attempt + 1}次): {webhook_url}")
@@ -873,12 +997,13 @@ class PC28Monitor:
         
         accuracies = [d["accuracy"] for d in trend_data]
         
-        # 分区间统计
+        # 分区间统计 (使用配置化阈值)
+        monitoring_config = get_monitoring_config()
         ranges = {
-            "excellent": sum(1 for a in accuracies if a >= 0.70),  # >=70%
-            "good": sum(1 for a in accuracies if 0.60 <= a < 0.70),  # 60-70%
-            "average": sum(1 for a in accuracies if 0.50 <= a < 0.60),  # 50-60%
-            "poor": sum(1 for a in accuracies if a < 0.50)  # <50%
+            "excellent": sum(1 for a in accuracies if a >= monitoring_config.ACCURACY_EXCELLENT),
+            "good": sum(1 for a in accuracies if monitoring_config.ACCURACY_GOOD_MIN <= a < monitoring_config.ACCURACY_GOOD_MAX),
+            "average": sum(1 for a in accuracies if monitoring_config.ACCURACY_AVERAGE_MIN <= a < monitoring_config.ACCURACY_AVERAGE_MAX),
+            "poor": sum(1 for a in accuracies if a < monitoring_config.ACCURACY_POOR_MAX)
         }
         
         # 统计指标

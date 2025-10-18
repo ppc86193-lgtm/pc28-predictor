@@ -12,14 +12,16 @@ from dataclasses import dataclass
 
 from config import redis_client
 from monitor import get_monitor
+from markov_model import get_dynamic_markov_model
+from config_constants import get_monitoring_config
 
 logger = logging.getLogger(__name__)
 
 @dataclass
 class OptimizationConfig:
     """优化配置"""
-    min_accuracy_threshold: float = 0.56  # 最低准确率阈值
-    target_accuracy: float = 0.65  # 目标准确率
+    min_accuracy_threshold: float = get_monitoring_config().LOW_ACCURACY_THRESHOLD  # 最低准确率阈值
+    target_accuracy: float = 0.65  # Keep as target, not threshold  # 目标准确率
     optimization_window: int = 100  # 优化窗口大小
     learning_rate: float = 0.01  # 学习率
     max_adjustment: float = 0.1  # 最大调整幅度
@@ -82,6 +84,14 @@ class PC28Optimizer:
             # 获取性能指标
             performance = monitor.get_performance_metrics()
             
+            # 获取动态马尔可夫模型状态
+            try:
+                dynamic_model = get_dynamic_markov_model()
+                dynamic_stats = dynamic_model.get_optimization_stats()
+            except Exception as e:
+                logger.warning(f"Failed to get dynamic Markov stats: {e}")
+                dynamic_stats = {"error": str(e)}
+            
             # 分析结果
             analysis = {
                 "current_accuracy": {
@@ -94,6 +104,7 @@ class PC28Optimizer:
                     "avg_response_time": performance.get("response_time", {}).get("avg_ms", 0.0),
                     "accuracy_trend": performance.get("accuracy", {}).get("trend", "stable")
                 },
+                "dynamic_markov": dynamic_stats,
                 "recommendations": []
             }
             
@@ -121,6 +132,31 @@ class PC28Optimizer:
                     "message": "准确率呈下降趋势",
                     "action": "adjust_parameters"
                 })
+            
+            # 基于动态马尔可夫模型状态的建议
+            if "error" not in dynamic_stats:
+                ema_stability = dynamic_stats.get("ema_stability", "unknown")
+                current_ema_alpha = dynamic_stats.get("current_ema_alpha", 0.3)
+                
+                if ema_stability == "adjusting":
+                    analysis["recommendations"].append({
+                        "type": "ema_adjusting",
+                        "message": f"EMA权重正在调整中 (当前α={current_ema_alpha:.3f})",
+                        "action": "monitor_stability"
+                    })
+                
+                if current_ema_alpha >= 0.8:
+                    analysis["recommendations"].append({
+                        "type": "ema_high_responsiveness",
+                        "message": f"EMA响应性过高 (α={current_ema_alpha:.3f})",
+                        "action": "consider_parameter_tuning"
+                    })
+                elif current_ema_alpha <= 0.15:
+                    analysis["recommendations"].append({
+                        "type": "ema_low_responsiveness", 
+                        "message": f"EMA响应性过低 (α={current_ema_alpha:.3f})",
+                        "action": "consider_parameter_tuning"
+                    })
             
             return analysis
             
