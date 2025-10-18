@@ -3,7 +3,7 @@
 ## Overview
 AI/ML API Model Extraction and PC28 Prediction System with optimized second-order Markov chain analysis.
 
-**Current Phase: 1 - Project Setup**
+**Current Phase: 2 - Data Models Implementation**
 
 ## Features (Planned)
 - Second-order Markov chain with 5 states (大单, 小双, 小单, 大双, 极值)
@@ -55,10 +55,43 @@ Configuration is managed through `config.json`:
 - Redis connection settings
 - External API endpoints
 
+## Data Models
+
+### PC28Data
+Core lottery data model with validation:
+- `sum`: Integer (0-27) - Sum of three numbers
+- `tail`: Integer (0-9) - Last digit of sum  
+- `combination`: Enum ["大单", "小双", "小单", "大双", "极值"] - Combination type
+- `period`: Optional string - Period identifier
+- `timestamp`: Optional datetime - Draw timestamp
+- `numbers`: Optional list - Original three numbers
+
+### PredictionResult
+Prediction output model:
+- `sum_range`: String - Predicted sum range
+- `combination`: String - Predicted combination
+- `probabilities`: Dict - Probability distribution
+- `confidence`: Float (0-1) - Prediction confidence
+
+### TailFrequencyResult
+Statistical analysis result:
+- `frequencies`: Dict - Tail frequency distribution
+- `chi_square_statistic`: Float - Chi-square test statistic
+- `p_value`: Float (0-1) - Statistical p-value
+- `is_significant`: Boolean - Statistical significance
+
+### ModelInfo
+AI/ML model information:
+- `id`: String - Model identifier
+- `name`: String - Model name
+- `developer`: String - Model developer
+- `type`: String - Model type
+- `context_length`: Optional int - Context length
+
 ## Development Phases
 
-1. **Phase 1** (Current): Project setup and configuration ✅
-2. **Phase 2**: Data models and validation
+1. **Phase 1**: Project setup and configuration ✅
+2. **Phase 2** (Current): Data models and validation ✅
 3. **Phase 3**: API client implementation
 4. **Phase 4**: Statistical engines (Markov chain, tail analysis)
 5. **Phase 5**: Prediction system integration
@@ -79,14 +112,27 @@ Configuration is managed through `config.json`:
 
 ## Testing
 
-### Phase 1 Testing
+### Phase 2 Testing
 ```bash
+# Run data model tests
+source venv/bin/activate
+python -m pytest test_data_models.py -v
+
 # Test system health
 curl http://localhost:8000/health
 
 # Test system info
 curl http://localhost:8000/
 ```
+
+### Test Coverage
+- ✅ PC28Data validation (sum, tail, combination)
+- ✅ PredictionResult model
+- ✅ TailFrequencyResult model  
+- ✅ ModelInfo model
+- ✅ extract_features function
+- ✅ validate_pc28_data function
+- ✅ categorize_models function
 
 ## License
 Private development project
