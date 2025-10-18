@@ -48,7 +48,7 @@ class RealPC28DataFetcher:
     
     def fetch_historical_data(self, limit: int = 5000) -> List[PC28Data]:
         """
-        从API获取真实历史数据
+        从API获取真实历史数据（使用日期回填）
         
         Args:
             limit: 获取数据条数
@@ -56,70 +56,107 @@ class RealPC28DataFetcher:
         Returns:
             PC28Data列表
         """
+        from datetime import datetime, timedelta
+        
+        all_data = []
+        
         try:
-            # 构建请求参数
-            timestamp = str(int(time.time()))
-            sign_str = f"{self.app_id}{timestamp}{self.api_key}"
-            sign = hashlib.md5(sign_str.encode()).hexdigest()
+            # 计算需要获取多少天的数据
+            # 每天约280期（每5分钟一期，24小时）
+            days_needed = min((limit // 280) + 1, 30)  # 限制最多30天，避免过多请求
             
-            params = {
-                "app_id": self.app_id,
-                "timestamp": timestamp,
-                "sign": sign,
-                "rows": min(limit, 5000)  # API限制
-            }
+            logger.info(f"请求历史数据: {limit}条，预计需要{days_needed}天")
             
-            logger.info(f"请求历史数据: {limit}条")
-            response = requests.get(self.history_url, params=params, timeout=10)
-            response.raise_for_status()
-            
-            data = response.json()
-            
-            if data.get("code") != 0:
-                raise Exception(f"API返回错误: {data.get('msg')}")
-            
-            # 解析数据
-            records = data.get("data", {}).get("list", [])
-            pc28_data_list = []
-            
-            for record in records:
+            # 从今天开始往前获取
+            for day_offset in range(days_needed):
+                # 提前检查是否已获取足够数据
+                if len(all_data) >= limit:
+                    logger.info(f"已获取足够数据: {len(all_data)}条，停止请求")
+                    break
+                
+                date = (datetime.now() - timedelta(days=day_offset)).strftime("%Y-%m-%d")
+                
+                # 构建请求参数 - 按字典序排序: appid, date
+                sign_str = f"appid{self.app_id}date{date}{self.api_key}"
+                sign = hashlib.md5(sign_str.encode()).hexdigest()
+                
+                params = {
+                    "appid": self.app_id,
+                    "date": date,
+                    "sign": sign
+                }
+                
+                logger.info(f"请求日期 {date} 的数据...")
+                
                 try:
-                    # 解析开奖号码
-                    numbers_str = record.get("opencode", "")
-                    numbers = [int(n) for n in numbers_str.split(",") if n.isdigit()]
+                    response = requests.get(self.history_url, params=params, timeout=10)
+                    response.raise_for_status()
                     
-                    if len(numbers) != 3:
+                    data = response.json()
+                    
+                    if data.get("codeid") != 10000:
+                        logger.warning(f"日期 {date} API返回错误: {data.get('message')}")
                         continue
-                    
-                    # 计算和值和尾数
-                    sum_val = sum(numbers)
-                    tail = sum_val % 10
-                    
-                    # 确定组合类型
-                    if sum_val <= 5 or sum_val >= 22:
-                        combination = "极值"
-                    elif sum_val % 2 == 0:  # 偶数
-                        combination = "大双" if sum_val >= 14 else "小双"
-                    else:  # 奇数
-                        combination = "大单" if sum_val >= 14 else "小单"
-                    
-                    # 创建PC28Data对象
-                    pc28_data = PC28Data(
-                        sum=sum_val,
-                        tail=tail,
-                        combination=combination,
-                        period=record.get("expect", ""),
-                        numbers=numbers
-                    )
-                    
-                    pc28_data_list.append(pc28_data)
-                    
-                except Exception as e:
-                    logger.warning(f"解析记录失败: {e}")
+                except requests.exceptions.RequestException as req_err:
+                    logger.warning(f"日期 {date} 请求失败: {req_err}")
                     continue
             
-            logger.info(f"成功获取 {len(pc28_data_list)} 条真实历史数据")
-            return pc28_data_list
+                # 解析数据
+                records = data.get("retdata", [])
+                logger.info(f"日期 {date} 获取到 {len(records)} 条数据")
+                
+                for record in records:
+                    try:
+                        # 解析开奖号码
+                        numbers = record.get("number", [])
+                        if isinstance(numbers, str):
+                            numbers = [int(n) for n in numbers.split(",") if n.isdigit()]
+                        elif isinstance(numbers, list):
+                            numbers = [int(n) for n in numbers if str(n).isdigit()]
+                        
+                        if len(numbers) != 3:
+                            continue
+                        
+                        # 计算和值和尾数
+                        sum_val = sum(numbers)
+                        tail = sum_val % 10
+                        
+                        # 确定组合类型
+                        if sum_val <= 5 or sum_val >= 22:
+                            combination = "极值"
+                        elif sum_val % 2 == 0:  # 偶数
+                            combination = "大双" if sum_val >= 14 else "小双"
+                        else:  # 奇数
+                            combination = "大单" if sum_val >= 14 else "小单"
+                        
+                        # 创建PC28Data对象
+                        pc28_data = PC28Data(
+                            sum=sum_val,
+                            tail=tail,
+                            combination=combination,
+                            period=record.get("long_issue", ""),
+                            numbers=numbers
+                        )
+                        
+                        all_data.append(pc28_data)
+                        
+                        # 达到目标数量就停止
+                        if len(all_data) >= limit:
+                            break
+                        
+                    except Exception as e:
+                        logger.warning(f"解析记录失败: {e}")
+                        continue
+                
+                # 达到目标数量就停止
+                if len(all_data) >= limit:
+                    break
+                
+                # 避免请求过快
+                time.sleep(0.5)
+            
+            logger.info(f"成功获取 {len(all_data)} 条真实历史数据")
+            return all_data[:limit]  # 返回指定数量
             
         except requests.exceptions.RequestException as e:
             logger.error(f"API请求失败: {e}")
