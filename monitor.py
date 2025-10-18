@@ -25,6 +25,15 @@ MAX_ACCURACY_WINDOW = 100
 BATCH_SIZE = 100
 TREND_THRESHOLD = 0.05
 
+# Alert and trend analysis constants
+MAX_TREND_DAYS = 30
+MIN_TREND_DAYS = 1
+LOW_ACCURACY_THRESHOLD = 0.50
+TREND_COMPARISON_THRESHOLD = 0.05
+MAX_ALERTS_STORED = 100
+ALERT_RETENTION_DAYS = 7
+MIN_TREND_DATA_POINTS = 3
+
 @dataclass
 class PredictionRecord:
     """记录单次预测的完整信息"""
@@ -477,6 +486,172 @@ class PC28Monitor:
         except Exception as e:
             logger.error(f"Failed to cleanup old data: {e}")
     
+    def get_accuracy_trend(self, days: int = 7) -> Dict[str, Any]:
+        """
+        计算最近days天的准确率趋势
+        
+        Args:
+            days: 分析天数（默认7天）
+            
+        Returns:
+            每日准确率趋势数据
+        """
+        if days < MIN_TREND_DAYS or days > MAX_TREND_DAYS:
+            logger.error(f"Invalid days parameter: {days}")
+            return {"error": f"天数必须在{MIN_TREND_DAYS}-{MAX_TREND_DAYS}之间"}
+        
+        try:
+            # 获取最近的预测记录
+            recent_records = self._get_recent_predictions(hours=days * 24)
+            
+            if not recent_records:
+                return {
+                    "trend": [],
+                    "summary": {
+                        "total_days": 0,
+                        "avg_accuracy": 0.0,
+                        "trend_direction": "stable"
+                    }
+                }
+            
+            # 按日期分组统计
+            daily_stats = defaultdict(lambda: {"correct": 0, "total": 0})
+            
+            for record in recent_records:
+                if record.is_correct is not None:  # 只统计已有结果的记录
+                    date_key = record.timestamp.strftime("%Y-%m-%d")
+                    daily_stats[date_key]["total"] += 1
+                    if record.is_correct:
+                        daily_stats[date_key]["correct"] += 1
+            
+            # 计算每日准确率
+            trend_data = []
+            for date_str in sorted(daily_stats.keys())[-days:]:
+                stats = daily_stats[date_str]
+                accuracy = stats["correct"] / stats["total"] if stats["total"] > 0 else 0.0
+                trend_data.append({
+                    "date": date_str,
+                    "accuracy": round(accuracy, 4),
+                    "total_predictions": stats["total"],
+                    "correct_predictions": stats["correct"]
+                })
+            
+            # 计算趋势方向
+            trend_direction = "stable"
+            if len(trend_data) >= MIN_TREND_DATA_POINTS:
+                recent_avg = sum(d["accuracy"] for d in trend_data[-MIN_TREND_DATA_POINTS:]) / MIN_TREND_DATA_POINTS
+                earlier_avg = sum(d["accuracy"] for d in trend_data[:MIN_TREND_DATA_POINTS]) / MIN_TREND_DATA_POINTS
+                
+                if recent_avg > earlier_avg + TREND_COMPARISON_THRESHOLD:
+                    trend_direction = "improving"
+                elif recent_avg < earlier_avg - TREND_COMPARISON_THRESHOLD:
+                    trend_direction = "declining"
+            
+            # 计算总体统计
+            total_correct = sum(d["correct_predictions"] for d in trend_data)
+            total_predictions = sum(d["total_predictions"] for d in trend_data)
+            avg_accuracy = total_correct / total_predictions if total_predictions > 0 else 0.0
+            
+            result = {
+                "trend": trend_data,
+                "summary": {
+                    "total_days": len(trend_data),
+                    "avg_accuracy": round(avg_accuracy, 4),
+                    "trend_direction": trend_direction,
+                    "total_predictions": total_predictions,
+                    "total_correct": total_correct
+                }
+            }
+            
+            # 触发低准确率警报
+            if avg_accuracy < LOW_ACCURACY_THRESHOLD:
+                self.trigger_alert("low_accuracy", {
+                    "accuracy": avg_accuracy,
+                    "threshold": LOW_ACCURACY_THRESHOLD,
+                    "days": days
+                })
+            
+            logger.info(f"Accuracy trend calculated: {avg_accuracy:.3f} over {days} days")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Failed to calculate accuracy trend: {e}")
+            return {"error": str(e)}
+    
+    def trigger_alert(self, alert_type: str, data: Dict[str, Any]) -> None:
+        """
+        触发系统警报
+        
+        Args:
+            alert_type: 警报类型
+            data: 警报数据
+        """
+        # Input validation
+        if not isinstance(alert_type, str) or not alert_type.strip():
+            logger.error(f"Invalid alert_type: {alert_type}")
+            return
+        
+        if not isinstance(data, dict):
+            logger.error(f"Invalid data type for alert: {type(data)}")
+            return
+        
+        try:
+            alert = {
+                "type": alert_type,
+                "timestamp": datetime.now().isoformat(),
+                "data": data,
+                "severity": "warning" if alert_type == "low_accuracy" else "info"
+            }
+            
+            # 记录警报到Redis
+            alert_key = f"{self.cache_prefix}alerts"
+            redis_client.lpush(alert_key, json.dumps(alert))
+            redis_client.ltrim(alert_key, 0, MAX_ALERTS_STORED - 1)  # 保留最近100个警报
+            redis_client.expire(alert_key, ALERT_RETENTION_DAYS * 24 * 3600)  # 7天过期
+            
+            # 根据警报类型记录不同级别的日志
+            if alert_type == "low_accuracy":
+                logger.warning(f"低准确率警报：{data['accuracy']:.2%} < {data['threshold']:.2%} (过去{data['days']}天)")
+            else:
+                logger.info(f"系统警报 [{alert_type}]: {data}")
+                
+        except Exception as e:
+            logger.error(f"Failed to trigger alert: {e}")
+    
+    def get_alerts(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """
+        获取系统警报历史
+        
+        Args:
+            limit: 返回警报数量限制 (1-1000)
+            
+        Returns:
+            警报列表
+        """
+        # Input validation
+        if not isinstance(limit, int) or limit < 1 or limit > 1000:
+            logger.error(f"Invalid limit parameter: {limit}")
+            return []
+        
+        try:
+            alert_key = f"{self.cache_prefix}alerts"
+            alerts_data = redis_client.lrange(alert_key, 0, limit - 1)
+            
+            alerts = []
+            for alert_data in alerts_data:
+                try:
+                    alert = json.loads(alert_data)
+                    alerts.append(alert)
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Failed to parse alert data: {e}")
+                    continue
+            
+            return alerts
+            
+        except Exception as e:
+            logger.error(f"Failed to get alerts: {e}")
+            return []
+
     def get_system_status(self) -> Dict[str, Any]:
         """获取系统状态概览"""
         try:
@@ -499,6 +674,11 @@ class PC28Monitor:
                 # Get total prediction count
                 all_records = redis_client.hgetall(self.prediction_history_key)
                 status["total_predictions"] = len(all_records)
+                
+                # Get recent alerts count
+                alert_key = f"{self.cache_prefix}alerts"
+                recent_alerts = redis_client.llen(alert_key)
+                status["recent_alerts"] = recent_alerts
                 
             except Exception as redis_error:
                 logger.warning(f"Redis connection failed: {redis_error}")

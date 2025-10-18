@@ -551,6 +551,69 @@ async def get_prediction_history(
         error_msg = f"History failed: {e}" if lang.startswith("en") else f"历史记录获取失败: {e}"
         raise HTTPException(status_code=500, detail=error_msg)
 
+@app.get("/monitor/trend")
+async def get_accuracy_trend(
+    days: int = Query(7, ge=1, le=30, description="Number of days to analyze"),
+    request: Request = None
+):
+    """Get accuracy trend analysis"""
+    lang = get_language(request)
+    
+    try:
+        monitor = get_monitor()
+        trend = monitor.get_accuracy_trend(days)
+        
+        if "error" in trend:
+            raise ValueError(trend["error"])
+        
+        if lang.startswith("en"):
+            return {
+                "status": "success",
+                "trend": trend,
+                "message": f"Accuracy trend for {days} days"
+            }
+        else:
+            return {
+                "status": "成功",
+                "trend": trend,
+                "message": f"{days} 天准确率趋势分析"
+            }
+            
+    except Exception as e:
+        logger.error(f"Failed to get accuracy trend: {e}")
+        error_msg = f"Trend analysis failed: {e}" if lang.startswith("en") else f"趋势分析失败: {e}"
+        raise HTTPException(status_code=500, detail=error_msg)
+
+@app.get("/monitor/alerts")
+async def get_system_alerts(
+    limit: int = Query(20, ge=1, le=100, description="Number of alerts to retrieve"),
+    request: Request = None
+):
+    """Get system alerts"""
+    lang = get_language(request)
+    
+    try:
+        monitor = get_monitor()
+        alerts = monitor.get_alerts(limit)
+        
+        if lang.startswith("en"):
+            return {
+                "status": "success",
+                "alerts": alerts,
+                "message": f"Retrieved {len(alerts)} system alerts"
+            }
+        else:
+            return {
+                "status": "成功",
+                "alerts": alerts,
+                "message": f"获取到 {len(alerts)} 条系统警报"
+            }
+            
+    except Exception as e:
+        logger.error(f"Failed to get system alerts: {e}")
+        error_msg = f"Alerts failed: {e}" if lang.startswith("en") else f"警报获取失败: {e}"
+        raise HTTPException(status_code=500, detail=error_msg)
+
 @app.delete("/cache")
 async def clear_system_cache(pattern: str = None, request: Request = None):
     """Clear system cache"""
