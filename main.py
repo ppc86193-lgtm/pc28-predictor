@@ -569,14 +569,22 @@ async def get_accuracy_trend(
         if lang.startswith("en"):
             return {
                 "status": "success",
-                "trend": trend,
-                "message": f"Accuracy trend for {days} days"
+                "data": {
+                    "trend": trend["trend"],
+                    "direction": trend["direction"],
+                    "summary": trend["summary"]
+                },
+                "message": f"{days} days accuracy trend analysis with direction: {trend['direction']}"
             }
         else:
             return {
                 "status": "成功",
-                "trend": trend,
-                "message": f"{days} 天准确率趋势分析"
+                "data": {
+                    "trend": trend["trend"],
+                    "direction": trend["direction"],
+                    "summary": trend["summary"]
+                },
+                "message": f"{days} 天准确率趋势分析，方向：{trend['direction']}"
             }
             
     except Exception as e:
@@ -586,32 +594,86 @@ async def get_accuracy_trend(
 
 @app.get("/monitor/alerts")
 async def get_system_alerts(
-    limit: int = Query(20, ge=1, le=100, description="Number of alerts to retrieve"),
+    limit: int = Query(20, ge=1, le=100, description="警报数量限制（1-100）"),
+    severity: str = Query(None, description="严重性级别过滤（info/warning/error）"),
     request: Request = None
 ):
-    """Get system alerts"""
+    """获取系统警报，支持按严重性过滤"""
     lang = get_language(request)
     
     try:
         monitor = get_monitor()
-        alerts = monitor.get_alerts(limit)
+        alerts_result = monitor.get_alerts(limit, severity)
+        
+        if "error" in alerts_result:
+            raise ValueError(alerts_result["error"])
+        
+        alerts = alerts_result.get("alerts", [])
+        stats = alerts_result.get("stats", {})
         
         if lang.startswith("en"):
             return {
                 "status": "success",
-                "alerts": alerts,
-                "message": f"Retrieved {len(alerts)} system alerts"
+                "data": {
+                    "alerts": alerts,
+                    "stats": stats,
+                    "total_count": alerts_result.get("total_count", 0),
+                    "filtered_by": severity
+                },
+                "message": f"Retrieved {len(alerts)} system alerts" + (f" (filtered by {severity})" if severity else "")
             }
         else:
             return {
                 "status": "成功",
-                "alerts": alerts,
-                "message": f"获取到 {len(alerts)} 条系统警报"
+                "data": {
+                    "alerts": alerts,
+                    "stats": stats,
+                    "total_count": alerts_result.get("total_count", 0),
+                    "filtered_by": severity
+                },
+                "message": f"获取到 {len(alerts)} 条系统警报" + (f"（按{severity}级别过滤）" if severity else "")
             }
             
     except Exception as e:
         logger.error(f"Failed to get system alerts: {e}")
         error_msg = f"Alerts failed: {e}" if lang.startswith("en") else f"警报获取失败: {e}"
+        raise HTTPException(status_code=500, detail=error_msg)
+
+@app.get("/monitor/visualization")
+async def get_monitor_visualization(
+    days: int = Query(7, ge=1, le=30, description="可视化数据天数（1-30）"),
+    request: Request = None
+):
+    """获取监控数据可视化，供前端图表渲染"""
+    lang = get_language(request)
+    
+    try:
+        monitor = get_monitor()
+        viz_data = monitor.get_visualization_data(days)
+        
+        if "error" in viz_data:
+            raise ValueError(viz_data["error"])
+        
+        if lang.startswith("en"):
+            return {
+                "status": "success",
+                "data": {
+                    "visualization": viz_data
+                },
+                "message": f"Generated visualization data for {days} days"
+            }
+        else:
+            return {
+                "status": "成功",
+                "data": {
+                    "visualization": viz_data
+                },
+                "message": f"生成 {days} 天可视化数据"
+            }
+            
+    except Exception as e:
+        logger.error(f"Failed to get visualization data: {e}")
+        error_msg = f"Visualization failed: {e}" if lang.startswith("en") else f"可视化数据获取失败: {e}"
         raise HTTPException(status_code=500, detail=error_msg)
 
 @app.delete("/cache")

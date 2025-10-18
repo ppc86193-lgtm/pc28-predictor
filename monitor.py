@@ -488,13 +488,13 @@ class PC28Monitor:
     
     def get_accuracy_trend(self, days: int = 7) -> Dict[str, Any]:
         """
-        计算最近days天的准确率趋势
+        计算最近days天的准确率趋势和智能方向分析
         
         Args:
             days: 分析天数（默认7天）
             
         Returns:
-            每日准确率趋势数据
+            每日准确率趋势数据，包含智能方向分析
         """
         if days < MIN_TREND_DAYS or days > MAX_TREND_DAYS:
             logger.error(f"Invalid days parameter: {days}")
@@ -507,6 +507,7 @@ class PC28Monitor:
             if not recent_records:
                 return {
                     "trend": [],
+                    "direction": "stable",
                     "summary": {
                         "total_days": 0,
                         "avg_accuracy": 0.0,
@@ -536,16 +537,8 @@ class PC28Monitor:
                     "correct_predictions": stats["correct"]
                 })
             
-            # 计算趋势方向
-            trend_direction = "stable"
-            if len(trend_data) >= MIN_TREND_DATA_POINTS:
-                recent_avg = sum(d["accuracy"] for d in trend_data[-MIN_TREND_DATA_POINTS:]) / MIN_TREND_DATA_POINTS
-                earlier_avg = sum(d["accuracy"] for d in trend_data[:MIN_TREND_DATA_POINTS]) / MIN_TREND_DATA_POINTS
-                
-                if recent_avg > earlier_avg + TREND_COMPARISON_THRESHOLD:
-                    trend_direction = "improving"
-                elif recent_avg < earlier_avg - TREND_COMPARISON_THRESHOLD:
-                    trend_direction = "declining"
+            # 智能趋势方向分析
+            trend_direction = self._analyze_trend_direction(trend_data)
             
             # 计算总体统计
             total_correct = sum(d["correct_predictions"] for d in trend_data)
@@ -554,6 +547,7 @@ class PC28Monitor:
             
             result = {
                 "trend": trend_data,
+                "direction": trend_direction,
                 "summary": {
                     "total_days": len(trend_data),
                     "avg_accuracy": round(avg_accuracy, 4),
@@ -563,6 +557,13 @@ class PC28Monitor:
                 }
             }
             
+            # 触发趋势警报
+            self.trigger_alert("trend", {
+                "direction": trend_direction,
+                "accuracy": avg_accuracy,
+                "days": days
+            })
+            
             # 触发低准确率警报
             if avg_accuracy < LOW_ACCURACY_THRESHOLD:
                 self.trigger_alert("low_accuracy", {
@@ -571,20 +572,54 @@ class PC28Monitor:
                     "days": days
                 })
             
-            logger.info(f"Accuracy trend calculated: {avg_accuracy:.3f} over {days} days")
+            logger.info(f"Accuracy trend calculated: {avg_accuracy:.3f} over {days} days, direction: {trend_direction}")
             return result
             
         except Exception as e:
             logger.error(f"Failed to calculate accuracy trend: {e}")
             return {"error": str(e)}
     
-    def trigger_alert(self, alert_type: str, data: Dict[str, Any]) -> None:
+    def _analyze_trend_direction(self, trend_data: List[Dict[str, Any]]) -> str:
         """
-        触发系统警报
+        智能分析趋势方向
         
         Args:
-            alert_type: 警报类型
+            trend_data: 趋势数据列表
+            
+        Returns:
+            趋势方向: improving/declining/stable
+        """
+        if len(trend_data) < 2:
+            return "stable"
+        
+        # 方法1: 对比前后期平均值（优先使用）
+        if len(trend_data) >= 4:  # 至少4个数据点
+            mid_point = len(trend_data) // 2
+            recent_avg = sum(d["accuracy"] for d in trend_data[mid_point:]) / len(trend_data[mid_point:])
+            earlier_avg = sum(d["accuracy"] for d in trend_data[:mid_point]) / mid_point
+            
+            delta = recent_avg - earlier_avg
+            if abs(delta) > 0.05:  # 5%阈值，更明显的趋势
+                return "improving" if delta > 0 else "declining"
+        
+        # 方法2: 简单对比最近两天（作为备选）
+        recent_accuracy = trend_data[-1]["accuracy"]
+        previous_accuracy = trend_data[-2]["accuracy"]
+        delta = recent_accuracy - previous_accuracy
+        
+        if abs(delta) > 0.10:  # 10%阈值，避免噪音
+            return "improving" if delta > 0 else "declining"
+        
+        return "stable"
+    
+    def trigger_alert(self, alert_type: str, data: Dict[str, Any], webhook_url: str = "https://webhook.example.com") -> None:
+        """
+        触发系统警报并发送Webhook通知
+        
+        Args:
+            alert_type: 警报类型 (low_accuracy/trend/system)
             data: 警报数据
+            webhook_url: Webhook通知URL
         """
         # Input validation
         if not isinstance(alert_type, str) or not alert_type.strip():
@@ -595,12 +630,19 @@ class PC28Monitor:
             logger.error(f"Invalid data type for alert: {type(data)}")
             return
         
+        if alert_type not in ["low_accuracy", "trend", "system"]:
+            logger.error(f"Invalid alert_type: {alert_type}")
+            return
+        
         try:
+            # 确定警报严重性
+            severity = self._determine_alert_severity(alert_type, data)
+            
             alert = {
                 "type": alert_type,
                 "timestamp": datetime.now().isoformat(),
                 "data": data,
-                "severity": "warning" if alert_type == "low_accuracy" else "info"
+                "severity": severity
             }
             
             # 记录警报到Redis
@@ -609,48 +651,295 @@ class PC28Monitor:
             redis_client.ltrim(alert_key, 0, MAX_ALERTS_STORED - 1)  # 保留最近100个警报
             redis_client.expire(alert_key, ALERT_RETENTION_DAYS * 24 * 3600)  # 7天过期
             
+            # 发送Webhook通知（仅对warning级别）
+            if severity == "warning":
+                self._send_webhook_notification(webhook_url, alert)
+            
             # 根据警报类型记录不同级别的日志
             if alert_type == "low_accuracy":
-                logger.warning(f"低准确率警报：{data['accuracy']:.2%} < {data['threshold']:.2%} (过去{data['days']}天)")
+                logger.warning(f"低准确率警报：{data.get('accuracy', 0):.2%} < {data.get('threshold', 0.5):.2%} (过去{data.get('days', 0)}天)")
+            elif alert_type == "trend":
+                logger.info(f"趋势警报：方向={data.get('direction', 'unknown')}, 准确率={data.get('accuracy', 0):.2%}")
             else:
                 logger.info(f"系统警报 [{alert_type}]: {data}")
                 
         except Exception as e:
             logger.error(f"Failed to trigger alert: {e}")
     
-    def get_alerts(self, limit: int = 50) -> List[Dict[str, Any]]:
+    def _determine_alert_severity(self, alert_type: str, data: Dict[str, Any]) -> str:
         """
-        获取系统警报历史
+        确定警报严重性级别
+        
+        Args:
+            alert_type: 警报类型
+            data: 警报数据
+            
+        Returns:
+            严重性级别: info/warning/error
+        """
+        if alert_type == "low_accuracy":
+            accuracy = data.get("accuracy", 1.0)
+            if accuracy < 0.40:
+                return "error"
+            elif accuracy < LOW_ACCURACY_THRESHOLD:
+                return "warning"
+        elif alert_type == "trend":
+            direction = data.get("direction", "stable")
+            accuracy = data.get("accuracy", 1.0)
+            if direction == "declining" and accuracy < 0.45:
+                return "warning"
+        elif alert_type == "system":
+            return data.get("severity", "info")
+        
+        return "info"
+    
+    def _send_webhook_notification(self, webhook_url: str, alert: Dict[str, Any]) -> None:
+        """
+        发送Webhook通知
+        
+        Args:
+            webhook_url: Webhook URL
+            alert: 警报数据
+        """
+        try:
+            import requests
+            
+            response = requests.post(
+                webhook_url,
+                json=alert,
+                timeout=5,
+                headers={"Content-Type": "application/json"}
+            )
+            response.raise_for_status()
+            logger.info(f"Webhook通知发送成功: {webhook_url}")
+            
+        except ImportError:
+            logger.warning("requests库未安装，跳过Webhook通知")
+        except Exception as e:
+            logger.error(f"Webhook通知失败 ({webhook_url}): {e}")
+            # 实现重试机制
+            self._retry_webhook_notification(webhook_url, alert)
+    
+    def _retry_webhook_notification(self, webhook_url: str, alert: Dict[str, Any], max_retries: int = 3) -> None:
+        """
+        Webhook通知重试机制
+        
+        Args:
+            webhook_url: Webhook URL
+            alert: 警报数据
+            max_retries: 最大重试次数
+        """
+        import time
+        import requests
+        
+        for attempt in range(max_retries):
+            try:
+                time.sleep(2 ** attempt)  # 指数退避: 2, 4, 8秒
+                response = requests.post(webhook_url, json=alert, timeout=5)
+                response.raise_for_status()
+                logger.info(f"Webhook重试成功 (第{attempt + 1}次): {webhook_url}")
+                return
+            except Exception as e:
+                logger.warning(f"Webhook重试失败 (第{attempt + 1}次): {e}")
+        
+        logger.error(f"Webhook通知最终失败，已重试{max_retries}次: {webhook_url}")
+    
+    def get_alerts(self, limit: int = 50, severity: str = None) -> Dict[str, Any]:
+        """
+        获取系统警报历史，支持按严重性过滤
         
         Args:
             limit: 返回警报数量限制 (1-1000)
+            severity: 严重性级别过滤 (info/warning/error)
             
         Returns:
-            警报列表
+            警报列表和统计信息
         """
         # Input validation
         if not isinstance(limit, int) or limit < 1 or limit > 1000:
             logger.error(f"Invalid limit parameter: {limit}")
-            return []
+            return {"alerts": [], "error": "limit必须在1-1000之间"}
+        
+        if severity and severity not in ["info", "warning", "error"]:
+            logger.error(f"Invalid severity parameter: {severity}")
+            return {"alerts": [], "error": "severity必须是info/warning/error之一"}
         
         try:
             alert_key = f"{self.cache_prefix}alerts"
-            alerts_data = redis_client.lrange(alert_key, 0, limit - 1)
+            alerts_data = redis_client.lrange(alert_key, 0, limit * 2 - 1)  # 获取更多数据以便过滤
             
             alerts = []
             for alert_data in alerts_data:
                 try:
                     alert = json.loads(alert_data)
+                    
+                    # 按严重性过滤
+                    if severity and alert.get("severity") != severity:
+                        continue
+                    
                     alerts.append(alert)
+                    
+                    # 达到限制数量就停止
+                    if len(alerts) >= limit:
+                        break
+                        
                 except json.JSONDecodeError as e:
                     logger.warning(f"Failed to parse alert data: {e}")
                     continue
             
-            return alerts
+            # 统计信息
+            stats = self._calculate_alert_stats(alerts_data)
+            
+            return {
+                "alerts": alerts,
+                "stats": stats,
+                "total_count": len(alerts),
+                "filtered_by": severity
+            }
             
         except Exception as e:
             logger.error(f"Failed to get alerts: {e}")
-            return []
+            return {"alerts": [], "error": str(e)}
+    
+    def get_visualization_data(self, days: int = 7) -> Dict[str, Any]:
+        """
+        生成监控数据可视化，供前端图表渲染
+        
+        Args:
+            days: 趋势分析天数
+            
+        Returns:
+            可视化数据包含趋势、警报统计、性能指标
+        """
+        try:
+            # 获取趋势数据
+            trend_result = self.get_accuracy_trend(days)
+            
+            # 获取警报统计
+            alerts_result = self.get_alerts(limit=100)
+            alert_stats = alerts_result.get("stats", {"info": 0, "warning": 0, "error": 0})
+            
+            # 获取性能指标
+            performance_metrics = self.get_performance_metrics()
+            
+            # 计算准确率分布
+            accuracy_distribution = self._calculate_accuracy_distribution(trend_result.get("trend", []))
+            
+            # 生成时间序列数据
+            time_series = self._generate_time_series_data(trend_result.get("trend", []))
+            
+            visualization_data = {
+                "trend": {
+                    "data": trend_result.get("trend", []),
+                    "direction": trend_result.get("direction", "stable"),
+                    "summary": trend_result.get("summary", {})
+                },
+                "alerts": {
+                    "stats": alert_stats,
+                    "recent_alerts": alerts_result.get("alerts", [])[:10]  # 最近10个警报
+                },
+                "performance": {
+                    "response_times": performance_metrics.get("response_times", {}),
+                    "accuracy_metrics": performance_metrics.get("accuracy_metrics", {})
+                },
+                "distribution": accuracy_distribution,
+                "time_series": time_series,
+                "metadata": {
+                    "generated_at": datetime.now().isoformat(),
+                    "days_analyzed": days,
+                    "data_points": len(trend_result.get("trend", []))
+                }
+            }
+            
+            logger.info(f"Generated visualization data for {days} days")
+            return visualization_data
+            
+        except Exception as e:
+            logger.error(f"Failed to generate visualization data: {e}")
+            return {"error": str(e)}
+    
+    def _calculate_accuracy_distribution(self, trend_data: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        计算准确率分布统计
+        
+        Args:
+            trend_data: 趋势数据
+            
+        Returns:
+            准确率分布信息
+        """
+        if not trend_data:
+            return {"ranges": {}, "average": 0.0, "std_dev": 0.0}
+        
+        accuracies = [d["accuracy"] for d in trend_data]
+        
+        # 分区间统计
+        ranges = {
+            "excellent": sum(1 for a in accuracies if a >= 0.70),  # >=70%
+            "good": sum(1 for a in accuracies if 0.60 <= a < 0.70),  # 60-70%
+            "average": sum(1 for a in accuracies if 0.50 <= a < 0.60),  # 50-60%
+            "poor": sum(1 for a in accuracies if a < 0.50)  # <50%
+        }
+        
+        # 统计指标
+        import statistics
+        avg_accuracy = statistics.mean(accuracies)
+        std_dev = statistics.stdev(accuracies) if len(accuracies) > 1 else 0.0
+        
+        return {
+            "ranges": ranges,
+            "average": round(avg_accuracy, 4),
+            "std_dev": round(std_dev, 4),
+            "min": min(accuracies),
+            "max": max(accuracies)
+        }
+    
+    def _generate_time_series_data(self, trend_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        生成时间序列数据，适合图表展示
+        
+        Args:
+            trend_data: 趋势数据
+            
+        Returns:
+            时间序列数据
+        """
+        time_series = []
+        
+        for i, data_point in enumerate(trend_data):
+            time_series.append({
+                "x": data_point["date"],
+                "y": data_point["accuracy"],
+                "predictions": data_point["total_predictions"],
+                "correct": data_point["correct_predictions"],
+                "day_index": i + 1
+            })
+        
+        return time_series
+    
+    def _calculate_alert_stats(self, alerts_data: List[str]) -> Dict[str, int]:
+        """
+        计算警报统计信息
+        
+        Args:
+            alerts_data: 原始警报数据列表
+            
+        Returns:
+            按严重性分组的统计信息
+        """
+        stats = {"info": 0, "warning": 0, "error": 0, "total": 0}
+        
+        for alert_data in alerts_data:
+            try:
+                alert = json.loads(alert_data)
+                severity = alert.get("severity", "info")
+                if severity in stats:
+                    stats[severity] += 1
+                stats["total"] += 1
+            except json.JSONDecodeError:
+                continue
+        
+        return stats
 
     def get_system_status(self) -> Dict[str, Any]:
         """获取系统状态概览"""
