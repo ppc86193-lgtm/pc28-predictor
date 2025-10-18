@@ -10,6 +10,8 @@ from config import api_key_aimlapi, api_key_data, app_id, real_time_url, history
 
 logger = logging.getLogger(__name__)
 
+# Error tracking will be defined after classes
+
 class PC28Data(BaseModel):
     """PC28 lottery data model with validation"""
     sum: conint(ge=0, le=27) = Field(..., description="Sum of three numbers (0-27)")
@@ -52,6 +54,88 @@ class ModelInfo(BaseModel):
     features: List[str] = Field(default_factory=list, description="Model features")
     url: Optional[str] = Field(None, description="Model documentation URL")
 
+class ErrorResponse(BaseModel):
+    """Standard error response format"""
+    error_code: str = Field(..., description="Error code identifier")
+    message: str = Field(..., description="Human-readable error message")
+    details: Optional[Dict[str, Any]] = Field(None, description="Additional error details")
+    timestamp: datetime = Field(default_factory=datetime.now, description="Error timestamp")
+    request_id: Optional[str] = Field(None, description="Request identifier for tracking")
+    
+class SystemHealth(BaseModel):
+    """System health status"""
+    status: Literal["healthy", "degraded", "unhealthy"] = Field(..., description="Overall system status")
+    redis_connected: bool = Field(..., description="Redis connection status")
+    aiml_api_available: bool = Field(False, description="AI/ML API availability")
+    pc28_api_available: bool = Field(False, description="PC28 API availability")
+    last_check: datetime = Field(default_factory=datetime.now, description="Last health check timestamp")
+    errors: List[str] = Field(default_factory=list, description="Current system errors")
+
+# Custom Exception Classes
+class PC28APIError(Exception):
+    """PC28 API related errors"""
+    def __init__(self, message: str, error_code: str = "PC28_API_ERROR", details: Dict[str, Any] = None):
+        self.message = message
+        self.error_code = error_code
+        self.details = details or {}
+        super().__init__(self.message)
+
+class AIMLAPIError(Exception):
+    """AI/ML API related errors"""
+    def __init__(self, message: str, error_code: str = "AIML_API_ERROR", details: Dict[str, Any] = None):
+        self.message = message
+        self.error_code = error_code
+        self.details = details or {}
+        super().__init__(self.message)
+
+class DataValidationError(Exception):
+    """Data validation related errors"""
+    def __init__(self, message: str, error_code: str = "DATA_VALIDATION_ERROR", details: Dict[str, Any] = None):
+        self.message = message
+        self.error_code = error_code
+        self.details = details or {}
+        super().__init__(self.message)
+
+class RedisConnectionError(Exception):
+    """Redis connection related errors"""
+    def __init__(self, message: str, error_code: str = "REDIS_CONNECTION_ERROR", details: Dict[str, Any] = None):
+        self.message = message
+        self.error_code = error_code
+        self.details = details or {}
+        super().__init__(self.message)
+
+# Error tracking
+error_counts = {
+    "pc28_api": 0,
+    "aiml_api": 0,
+    "redis": 0,
+    "validation": 0
+}
+
+def log_error(error_type: str, error: Exception, context: Dict[str, Any] = None) -> ErrorResponse:
+    """Log error and create standardized error response"""
+    error_counts[error_type] = error_counts.get(error_type, 0) + 1
+    
+    error_response = ErrorResponse(
+        error_code=getattr(error, 'error_code', f"{error_type.upper()}_ERROR"),
+        message=str(error),
+        details={
+            "error_type": error_type,
+            "error_count": error_counts[error_type],
+            "context": context or {}
+        }
+    )
+    
+    logger.error(f"[{error_type.upper()}] {error_response.message}", 
+                extra={"error_details": error_response.details})
+    
+    return error_response
+
+def reset_error_counts():
+    """Reset error counters (useful for testing)"""
+    global error_counts
+    error_counts = {key: 0 for key in error_counts}
+
 def generate_sign(params: Dict[str, str]) -> str:
     """Generate signature for PC28 API authentication"""
     sorted_params = ''.join(f"{k}{v}" for k, v in sorted(params.items()) if v) + api_key_data
@@ -67,11 +151,24 @@ def fetch_realtime_data() -> Dict[str, Any]:
         response = requests.post(real_time_url, data=params, timeout=5)
         response.raise_for_status()
         
+        data = response.json()
         logger.info("Successfully fetched real-time PC28 data")
-        return response.json()
+        return data
+        
+    except requests.exceptions.Timeout as e:
+        error = PC28APIError("Real-time API request timeout", "PC28_TIMEOUT", 
+                           {"url": real_time_url, "timeout": 5})
+        log_error("pc28_api", error)
+        raise error
+    except requests.exceptions.HTTPError as e:
+        error = PC28APIError(f"Real-time API HTTP error: {e.response.status_code}", 
+                           "PC28_HTTP_ERROR", {"status_code": e.response.status_code})
+        log_error("pc28_api", error)
+        raise error
     except Exception as e:
-        logger.error(f"Failed to fetch real-time data: {e}")
-        raise
+        error = PC28APIError(f"Real-time API error: {str(e)}", "PC28_GENERAL_ERROR")
+        log_error("pc28_api", error)
+        raise error
 
 def fetch_history_data(date: str, limit: int = 1000) -> Dict[str, Any]:
     """Fetch historical PC28 lottery data"""
@@ -82,24 +179,50 @@ def fetch_history_data(date: str, limit: int = 1000) -> Dict[str, Any]:
         response = requests.post(history_url, data=params, timeout=5)
         response.raise_for_status()
         
+        data = response.json()
         logger.info(f"Successfully fetched {limit} historical records for {date}")
-        return response.json()
+        return data
+        
+    except requests.exceptions.Timeout as e:
+        error = PC28APIError("History API request timeout", "PC28_TIMEOUT", 
+                           {"url": history_url, "timeout": 5, "date": date, "limit": limit})
+        log_error("pc28_api", error)
+        raise error
+    except requests.exceptions.HTTPError as e:
+        error = PC28APIError(f"History API HTTP error: {e.response.status_code}", 
+                           "PC28_HTTP_ERROR", {"status_code": e.response.status_code, "date": date})
+        log_error("pc28_api", error)
+        raise error
     except Exception as e:
-        logger.error(f"Failed to fetch history data: {e}")
-        raise
+        error = PC28APIError(f"History API error: {str(e)}", "PC28_GENERAL_ERROR", {"date": date})
+        log_error("pc28_api", error)
+        raise error
 
 def get_model_list() -> Dict[str, Any]:
     """Fetch AI/ML model list from external API"""
     try:
         headers = {"Authorization": f"Bearer {api_key_aimlapi}"}
-        response = requests.get(f"{aimlapi_base}/models", headers=headers)
+        response = requests.get(f"{aimlapi_base}/models", headers=headers, timeout=10)
         response.raise_for_status()
         
+        data = response.json()
         logger.info("Successfully fetched AI/ML model list")
-        return response.json()
+        return data
+        
+    except requests.exceptions.Timeout as e:
+        error = AIMLAPIError("AI/ML API request timeout", "AIML_TIMEOUT", 
+                           {"url": f"{aimlapi_base}/models", "timeout": 10})
+        log_error("aiml_api", error)
+        raise error
+    except requests.exceptions.HTTPError as e:
+        error = AIMLAPIError(f"AI/ML API HTTP error: {e.response.status_code}", 
+                           "AIML_HTTP_ERROR", {"status_code": e.response.status_code})
+        log_error("aiml_api", error)
+        raise error
     except Exception as e:
-        logger.error(f"Failed to fetch model list: {e}")
-        raise
+        error = AIMLAPIError(f"AI/ML API error: {str(e)}", "AIML_GENERAL_ERROR")
+        log_error("aiml_api", error)
+        raise error
 
 def extract_features(data: Dict[str, Any]) -> List[PC28Data]:
     """Extract and validate PC28 features from API response data"""
@@ -207,38 +330,65 @@ def categorize_models(models_data: Dict[str, Any]) -> Dict[str, List[ModelInfo]]
     logger.info(f"Categorized models: {sum(len(models) for models in categories.values())} total")
     return categories
 
-def test_api_connections() -> Dict[str, bool]:
-    """Test all API connections for system validation"""
-    results = {}
+def check_system_health() -> SystemHealth:
+    """Comprehensive system health check"""
+    from config import redis_client
+    
+    errors = []
+    redis_connected = False
+    aiml_api_available = False
+    pc28_api_available = False
+    
+    # Test Redis connection
+    try:
+        redis_connected = redis_client.ping()
+        if not redis_connected:
+            errors.append("Redis ping failed")
+    except Exception as e:
+        errors.append(f"Redis connection error: {str(e)}")
+        log_error("redis", RedisConnectionError(str(e)))
     
     # Test AI/ML API
     try:
         models_data = get_model_list()
         categorize_models(models_data)  # Test model processing
-        results['aiml_api'] = True
-        logger.info("AI/ML API connection: SUCCESS")
+        aiml_api_available = True
+        logger.info("AI/ML API health check: SUCCESS")
     except Exception as e:
-        results['aiml_api'] = False
-        logger.error(f"AI/ML API connection: FAILED - {e}")
+        errors.append(f"AI/ML API unavailable: {str(e)}")
+        aiml_api_available = False
     
-    # Test PC28 real-time API
+    # Test PC28 API (use smaller request for health check)
     try:
-        realtime_data = fetch_realtime_data()
-        extract_features(realtime_data)  # Test data processing
-        results['pc28_realtime'] = True
-        logger.info("PC28 real-time API connection: SUCCESS")
-    except Exception as e:
-        results['pc28_realtime'] = False
-        logger.error(f"PC28 real-time API connection: FAILED - {e}")
-    
-    # Test PC28 history API
-    try:
-        history_data = fetch_history_data("2025-10-18", 10)  # Small test request
+        history_data = fetch_history_data("2025-10-18", 5)  # Small test request
         extract_features(history_data)  # Test data processing
-        results['pc28_history'] = True
-        logger.info("PC28 history API connection: SUCCESS")
+        pc28_api_available = True
+        logger.info("PC28 API health check: SUCCESS")
     except Exception as e:
-        results['pc28_history'] = False
-        logger.error(f"PC28 history API connection: FAILED - {e}")
+        errors.append(f"PC28 API unavailable: {str(e)}")
+        pc28_api_available = False
     
-    return results
+    # Determine overall status
+    if redis_connected and aiml_api_available and pc28_api_available:
+        status = "healthy"
+    elif redis_connected and (aiml_api_available or pc28_api_available):
+        status = "degraded"
+    else:
+        status = "unhealthy"
+    
+    return SystemHealth(
+        status=status,
+        redis_connected=redis_connected,
+        aiml_api_available=aiml_api_available,
+        pc28_api_available=pc28_api_available,
+        errors=errors
+    )
+
+def test_api_connections() -> Dict[str, bool]:
+    """Test all API connections for system validation (legacy function)"""
+    health = check_system_health()
+    return {
+        'redis': health.redis_connected,
+        'aiml_api': health.aiml_api_available,
+        'pc28_api': health.pc28_api_available
+    }

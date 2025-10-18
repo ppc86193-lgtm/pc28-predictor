@@ -3,6 +3,7 @@ import uvicorn
 import json
 import logging
 from config import redis_client
+from api_client import check_system_health, ErrorResponse, SystemHealth
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -15,21 +16,28 @@ app = FastAPI(
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-@app.get("/health")
+@app.get("/health", response_model=SystemHealth)
 async def health_check():
-    """Health check endpoint to verify system status"""
+    """Comprehensive health check endpoint"""
     try:
-        # Test Redis connection
-        redis_status = redis_client.ping()
-        return {
-            "status": "healthy",
-            "redis": "connected" if redis_status else "disconnected",
-            "phase": "1 - Project Setup",
-            "message": "System initialized successfully"
-        }
+        health = check_system_health()
+        
+        if health.status == "unhealthy":
+            raise HTTPException(status_code=503, detail=health.dict())
+        elif health.status == "degraded":
+            logger.warning(f"System degraded: {health.errors}")
+            
+        return health
+        
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Health check failed: {e}")
-        raise HTTPException(status_code=503, detail=f"System unhealthy: {str(e)}")
+        error_response = ErrorResponse(
+            error_code="HEALTH_CHECK_ERROR",
+            message=f"Health check failed: {str(e)}"
+        )
+        raise HTTPException(status_code=503, detail=error_response.dict())
 
 @app.get("/")
 async def root():
