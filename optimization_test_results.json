@@ -1,0 +1,36 @@
+{
+  "test_summary": {
+    "total_cycles": 1000,
+    "successful_predictions": 1000,
+    "test_duration_seconds": 0.04
+  },
+  "accuracy_metrics": {
+    "combination_accuracy": 0.147,
+    "big_small_accuracy": 0.507,
+    "sum_range_accuracy": 0.245
+  },
+  "optimization_stats": {
+    "markov_model": {
+      "current_ema_alpha": 0.9,
+      "accuracy_samples": 100,
+      "avg_accuracy": 0.1461,
+      "ema_stability": "stable"
+    },
+    "tail_analyzer": {
+      "accuracy_samples": 100,
+      "avg_accuracy": 0.5739,
+      "current_boost_factor": 1.03,
+      "target_tails": [
+        7,
+        8,
+        9
+      ]
+    }
+  },
+  "targets_met": {
+    "combination": false,
+    "big_small": false,
+    "sum_range": false,
+    "all_targets": false
+  }
+}

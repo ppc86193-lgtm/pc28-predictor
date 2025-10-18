@@ -1,0 +1,16 @@
+{
+  "enabled": true,
+  "name": "Python Code Monitor",
+  "description": "Monitors Python files in the pc28_predictor project for changes and provides automated code review, suggestions for improvements, and catches potential issues",
+  "version": "1",
+  "when": {
+    "type": "fileEdited",
+    "patterns": [
+      "pc28_predictor/*.py"
+    ]
+  },
+  "then": {
+    "type": "askAgent",
+    "prompt": "A Python file has been modified in the pc28_predictor project. Please review the changes and provide feedback on code quality, potential bugs, performance improvements, and adherence to Python best practices. Focus on the specific changes made and suggest concrete improvements."
+  }
+}
