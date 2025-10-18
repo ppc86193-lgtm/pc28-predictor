@@ -1,0 +1,10 @@
+{
+  "api_key_aimlapi": "9030c9fcbc474c258dca7ff39b3a20e6",
+  "api_key_data": "ca9edbfee35c22a0d6c4cf6722506af0",
+  "app_id": "45928",
+  "real_time_url": "https://rijb.api.storeapi.net/api/119/259",
+  "history_url": "https://rijb.api.storeapi.net/api/119/260",
+  "aimlapi_base": "https://api.aimlapi.com/v1",
+  "redis_host": "localhost",
+  "redis_port": 6379
+}
