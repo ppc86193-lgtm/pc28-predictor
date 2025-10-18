@@ -22,28 +22,39 @@ app = FastAPI(
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-@app.get("/health", response_model=SystemHealth)
+@app.get("/health")
 async def health_check():
     """Comprehensive health check endpoint"""
     try:
         health = check_system_health()
         
+        # Convert to dict with proper datetime serialization
+        health_dict = {
+            "status": health.status,
+            "redis_connected": health.redis_connected,
+            "aiml_api_available": health.aiml_api_available,
+            "pc28_api_available": health.pc28_api_available,
+            "last_check": health.last_check.isoformat() if hasattr(health.last_check, 'isoformat') else str(health.last_check),
+            "errors": health.errors
+        }
+        
         if health.status == "unhealthy":
-            raise HTTPException(status_code=503, detail=health.dict())
+            raise HTTPException(status_code=503, detail=health_dict)
         elif health.status == "degraded":
             logger.warning(f"System degraded: {health.errors}")
             
-        return health
+        return health_dict
         
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Health check failed: {e}")
-        error_response = ErrorResponse(
-            error_code="HEALTH_CHECK_ERROR",
-            message=f"Health check failed: {str(e)}"
-        )
-        raise HTTPException(status_code=503, detail=error_response.dict())
+        error_response = {
+            "error_code": "HEALTH_CHECK_ERROR",
+            "message": f"Health check failed: {str(e)}",
+            "timestamp": datetime.now().isoformat()
+        }
+        raise HTTPException(status_code=503, detail=error_response)
 
 def get_language(request: Request) -> str:
     """Extract language from Accept-Language header"""

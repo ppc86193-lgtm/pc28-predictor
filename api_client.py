@@ -22,12 +22,6 @@ class PC28Data(BaseModel):
     timestamp: Optional[datetime] = Field(None, description="Draw timestamp")
     numbers: Optional[List[int]] = Field(None, description="Original three numbers")
 
-    model_config = {
-        "json_encoders": {
-            datetime: lambda v: v.isoformat()
-        }
-    }
-
 class PredictionResult(BaseModel):
     """Prediction result data model"""
     sum_range: str = Field(..., description="Predicted sum range")

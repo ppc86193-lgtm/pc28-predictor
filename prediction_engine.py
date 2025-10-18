@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 from api_client import (
     PC28Data, PredictionResult, TailFrequencyResult, 
-    fetch_realtime_data, fetch_history_data, extract_features
+    fetch_realtime_data, fetch_history_data
 )
 from tail_analyzer import (
     analyze_tail_frequency, adjust_probs_by_tail, 
@@ -26,6 +26,14 @@ from data_processor import extract_features as process_features
 from config import redis_client
 
 logger = logging.getLogger(__name__)
+
+# Constants
+MARKOV_WEIGHT = 0.7
+TAIL_WEIGHT = 0.3
+HIGH_CONFIDENCE_THRESHOLD = 0.4
+MEDIUM_CONFIDENCE_THRESHOLD = 0.3
+HIGH_ACCURACY_THRESHOLD = 0.65
+MEDIUM_ACCURACY_THRESHOLD = 0.55
 
 @dataclass
 class PredictionConfig:
@@ -59,6 +67,20 @@ class PC28PredictionEngine:
         self.performance_key = f"{self.cache_prefix}performance"
         
         logger.info(f"PC28 Prediction Engine initialized with config: {self.config}")
+    
+    def _convert_features_to_dicts(self, features: List[PC28Data]) -> List[Dict[str, Any]]:
+        """Convert PC28Data objects to dictionaries efficiently"""
+        feature_dicts = []
+        for feature in features:
+            if hasattr(feature, 'model_dump'):
+                feature_dicts.append(feature.model_dump())
+            else:
+                feature_dicts.append({
+                    'tail': feature.tail,
+                    'sum': feature.sum,
+                    'combination': feature.combination
+                })
+        return feature_dicts
     
     def generate_prediction(self, use_cache: bool = True) -> PredictionResult:
         """
@@ -138,17 +160,8 @@ class PC28PredictionEngine:
     def _analyze_tail_frequency(self, features: List[PC28Data]) -> Dict[str, Any]:
         """Perform comprehensive tail frequency analysis"""
         try:
-            # Convert PC28Data to dict format for tail analyzer
-            feature_dicts = []
-            for feature in features:
-                if hasattr(feature, 'model_dump'):
-                    feature_dicts.append(feature.model_dump())
-                else:
-                    feature_dicts.append({
-                        'tail': feature.tail,
-                        'sum': feature.sum,
-                        'combination': feature.combination
-                    })
+            # Convert PC28Data to dict format for tail analyzer (optimized)
+            feature_dicts = self._convert_features_to_dicts(features)
             
             # Basic tail frequency analysis
             tail_freq, p_value = analyze_tail_frequency(feature_dicts, self.config.tail_window)
@@ -180,17 +193,8 @@ class PC28PredictionEngine:
     def _generate_markov_prediction(self, features: List[PC28Data]) -> Dict[str, float]:
         """Generate prediction using second-order Markov chain"""
         try:
-            # Convert PC28Data to dict format for Markov model
-            feature_dicts = []
-            for feature in features:
-                if hasattr(feature, 'model_dump'):
-                    feature_dicts.append(feature.model_dump())
-                else:
-                    feature_dicts.append({
-                        'combination': feature.combination,
-                        'sum': feature.sum,
-                        'tail': feature.tail
-                    })
+            # Convert PC28Data to dict format for Markov model (reuse conversion)
+            feature_dicts = self._convert_features_to_dicts(features)
             
             # Build transition matrix
             transition_matrix, states, state_pairs = build_markov_2nd_order_matrix(
@@ -225,9 +229,9 @@ class PC28PredictionEngine:
             # Apply tail-based prediction weights
             tail_weights = tail_analysis['prediction_weights']
             
-            # Weighted combination (70% Markov, 30% tail weights)
-            markov_weight = 0.7
-            tail_weight = 0.3
+            # Weighted combination using constants
+            markov_weight = MARKOV_WEIGHT
+            tail_weight = TAIL_WEIGHT
             
             combined_probs = {}
             for state in self.config.states:
@@ -265,9 +269,9 @@ class PC28PredictionEngine:
                 confidence_factors.append(0.50)
             
             # Factor 2: Prediction probability strength
-            if predicted_probability > 0.4:
+            if predicted_probability > HIGH_CONFIDENCE_THRESHOLD:
                 confidence_factors.append(0.9)
-            elif predicted_probability > 0.3:
+            elif predicted_probability > MEDIUM_CONFIDENCE_THRESHOLD:
                 confidence_factors.append(0.75)
             else:
                 confidence_factors.append(0.6)
@@ -275,9 +279,9 @@ class PC28PredictionEngine:
             # Factor 3: Recent accuracy history
             if len(self.accuracy_history) >= 20:
                 recent_accuracy = sum(self.accuracy_history[-20:]) / 20
-                if recent_accuracy > 0.65:
+                if recent_accuracy > HIGH_ACCURACY_THRESHOLD:
                     confidence_factors.append(0.9)
-                elif recent_accuracy > 0.55:
+                elif recent_accuracy > MEDIUM_ACCURACY_THRESHOLD:
                     confidence_factors.append(0.75)
                 else:
                     confidence_factors.append(0.6)
@@ -334,7 +338,12 @@ class PC28PredictionEngine:
             cached_data = redis_client.get(f"{self.cache_prefix}prediction")
             if cached_data:
                 data = json.loads(cached_data)
+                # Convert timestamp string back to datetime
+                if 'timestamp' in data and isinstance(data['timestamp'], str):
+                    data['timestamp'] = datetime.fromisoformat(data['timestamp'])
                 return PredictionResult(**data)
+        except (json.JSONDecodeError, ValueError, TypeError) as e:
+            logger.warning(f"Cache data parsing failed: {e}")
         except Exception as e:
             logger.warning(f"Cache retrieval failed: {e}")
         return None
@@ -362,6 +371,12 @@ class PC28PredictionEngine:
     
     def update_accuracy(self, predicted: str, actual: str) -> float:
         """Update accuracy history with new prediction result"""
+        if not predicted or not actual:
+            raise ValueError("Predicted and actual values cannot be empty")
+        
+        if predicted not in self.config.states or actual not in self.config.states:
+            logger.warning(f"Invalid state values: predicted={predicted}, actual={actual}")
+        
         is_correct = 1 if predicted == actual else 0
         self.accuracy_history.append(is_correct)
         
@@ -441,6 +456,23 @@ class PC28PredictionEngine:
             logger.warning(f"Failed to clear cached data: {e}")
         
         logger.info("Performance data reset successfully")
+    
+    def cleanup_old_data(self, max_age_hours: int = 24):
+        """Clean up old cached data and trim history"""
+        try:
+            # Trim accuracy history if too large
+            max_history = self.config.accuracy_window * 3
+            if len(self.accuracy_history) > max_history:
+                self.accuracy_history = self.accuracy_history[-max_history:]
+                logger.info(f"Trimmed accuracy history to {len(self.accuracy_history)} entries")
+            
+            # Clean up old prediction history
+            if len(self.prediction_history) > 1000:
+                self.prediction_history = self.prediction_history[-500:]
+                logger.info("Trimmed prediction history")
+                
+        except Exception as e:
+            logger.error(f"Data cleanup failed: {e}")
 
 # Global prediction engine instance
 _prediction_engine = None
