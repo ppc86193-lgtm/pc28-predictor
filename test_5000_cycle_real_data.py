@@ -31,6 +31,7 @@ from markov_model import get_dynamic_markov_model
 from tail_analyzer import get_dynamic_tail_analyzer
 from monitor import get_monitor
 from api_client import PC28Data
+from optimized_predictor import get_optimized_predictor
 from config import api_key_data, app_id, history_url
 
 # Configure logging
@@ -173,12 +174,13 @@ class RealDataValidator:
         self.tail_analyzer = get_dynamic_tail_analyzer()
         self.monitor = get_monitor()
         self.data_fetcher = RealPC28DataFetcher()
+        self.optimized_predictor = get_optimized_predictor()  # 新增优化预测器
         
         # 准确率跟踪
         self.predictions = []
         self.results = []
         
-        logger.info("真实数据验证器初始化完成")
+        logger.info("真实数据验证器初始化完成（使用优化预测器）")
     
     def run_validation(self, limit: int = 5000) -> Dict[str, Any]:
         """
@@ -229,8 +231,10 @@ class RealDataValidator:
         # 处理每个测试周期
         for i, actual_data in enumerate(test_data_subset):
             try:
-                # 使用历史数据生成预测
-                prediction = self._generate_prediction(list(historical_window))
+                # 使用优化预测器生成预测
+                hist_data = [{'sum': d.sum, 'tail': d.tail, 'combination': d.combination} 
+                            for d in historical_window]
+                prediction = self.optimized_predictor.predict(hist_data)
                 
                 # 检查准确率
                 combination_match = prediction["combination"] == actual_data.combination
@@ -318,10 +322,9 @@ class RealDataValidator:
         return results
     
     def _generate_prediction(self, historical_data: List[PC28Data]) -> Dict[str, Any]:
-        """基于历史数据生成预测"""
+        """基于历史数据生成预测（优化版 - 提升准确率）"""
         
         if len(historical_data) < MIN_DATA_FOR_PREDICTION:
-            # 数据不足，返回默认预测
             return {
                 "combination": "大单",
                 "sum_range": "14-21",
@@ -329,7 +332,6 @@ class RealDataValidator:
                 "probabilities": {"大单": 0.25, "小双": 0.25, "小单": 0.25, "大双": 0.25}
             }
         
-        # 计算尾数频率（防御性编程）
         data_len = len(historical_data)
         if data_len == 0:
             return {
@@ -339,37 +341,81 @@ class RealDataValidator:
                 "probabilities": {"大单": 0.25, "小双": 0.25, "小单": 0.25, "大双": 0.25}
             }
         
-        tail_freq = {}
-        for i in range(10):
-            tail_freq[i] = sum(1 for d in historical_data if d.tail == i) / data_len
+        # Constants for probability bounds
+        MIN_BASE_PROB = 0.15
+        MAX_BASE_PROB = 0.35
+        HIGH_FREQ_THRESHOLD = 0.12
+        TAIL_BOOST_FACTOR = 1.15  # Reduced from 1.2 to avoid over-boosting
+        CONSECUTIVE_BOOST_FACTOR = 1.10  # Reduced from 1.15
         
-        # 基础概率
-        base_probs = {"大单": 0.25, "小双": 0.25, "小单": 0.25, "大双": 0.25}
+        # 1. 计算组合历史频率（基于真实数据分布）
+        from collections import Counter
+        combo_counts = Counter(d.combination for d in historical_data)
         
-        # 当前准确率
-        current_accuracy = 0.5 + 0.1 * (len(historical_data) / 100)
+        # 基础概率使用历史频率，限制在合理范围内
+        base_probs = {
+            k: max(MIN_BASE_PROB, min(MAX_BASE_PROB, v/data_len)) 
+            for k, v in combo_counts.items()
+        }
+        # 确保所有组合都有概率
+        for combo in ["大单", "小双", "小单", "大双", "极值"]:
+            if combo not in base_probs:
+                base_probs[combo] = MIN_BASE_PROB
         
-        # 应用尾数分析调整
-        adjusted_probs = self.tail_analyzer.adjust_probs_by_tail_dynamic(
-            base_probs, tail_freq, current_accuracy
-        )
+        total = sum(base_probs.values())
+        base_probs = {k: v/total for k, v in base_probs.items()}
         
-        # 选择组合（使用已设置seed的random）
-        rand_val = random.random()
-        cumulative = 0.0
-        selected_combination = "大单"
+        # 2. 计算尾数频率
+        tail_freq = {i: sum(1 for d in historical_data if d.tail == i) / data_len 
+                     for i in range(10)}
         
-        for combo, prob in adjusted_probs.items():
-            cumulative += prob
-            if rand_val <= cumulative:
-                selected_combination = combo
-                break
+        # 3. 检测连号模式（最近10条）
+        recent_tails = [d.tail for d in historical_data[-10:]]
+        consecutive_count = sum(1 for i in range(len(recent_tails)-1) 
+                               if abs(recent_tails[i] - recent_tails[i+1]) == 1)
+        has_consecutive = consecutive_count >= 3
         
-        # 生成和值范围
+        # 4. 尾数调整（增强高频尾数）- 使用累积调整因子避免重复乘法
+        adjusted_probs = base_probs.copy()
+        high_freq_tails = [t for t, f in tail_freq.items() if f > HIGH_FREQ_THRESHOLD]
+        
+        if high_freq_tails:
+            # 计算偶数和奇数高频尾数的数量
+            even_count = sum(1 for t in high_freq_tails if t % 2 == 0)
+            odd_count = sum(1 for t in high_freq_tails if t % 2 == 1)
+            
+            # 根据高频尾数数量调整，避免过度增强
+            if even_count > 0:
+                even_boost = 1.0 + (TAIL_BOOST_FACTOR - 1.0) * min(even_count / 3, 1.0)
+                adjusted_probs["小双"] *= even_boost
+                adjusted_probs["大双"] *= even_boost
+            
+            if odd_count > 0:
+                odd_boost = 1.0 + (TAIL_BOOST_FACTOR - 1.0) * min(odd_count / 3, 1.0)
+                adjusted_probs["大单"] *= odd_boost
+                adjusted_probs["小单"] *= odd_boost
+        
+        # 5. 连号调整
+        if has_consecutive:
+            adjusted_probs["小双"] *= CONSECUTIVE_BOOST_FACTOR
+            adjusted_probs["小单"] *= CONSECUTIVE_BOOST_FACTOR
+        
+        # 6. 归一化（确保总和为1.0）
+        total = sum(adjusted_probs.values())
+        if total > 0:
+            adjusted_probs = {k: v/total for k, v in adjusted_probs.items()}
+        else:
+            # Fallback to uniform distribution
+            adjusted_probs = {k: 0.2 for k in ["大单", "小双", "小单", "大双", "极值"]}
+        
+        # 7. 选择最高概率组合（不使用随机）
+        selected_combination = max(adjusted_probs.items(), key=lambda x: x[1])[0]
+        
+        # 8. 生成和值范围（更精确）
         if selected_combination == "大单":
-            sum_range = "14-21"
+            sum_range = "15-21"
         elif selected_combination == "小双":
-            sum_range = "6-13"
+            sum_range = "6-12"
         elif selected_combination == "小单":
             sum_range = "7-13"
         elif selected_combination == "大双":
