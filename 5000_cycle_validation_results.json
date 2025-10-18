@@ -2,12 +2,12 @@
   "test_summary": {
     "total_cycles": 5000,
     "successful_predictions": 5000,
-    "test_duration_seconds": 0.12
+    "test_duration_seconds": 0.11
   },
   "accuracy_metrics": {
-    "combination_accuracy": 0.1422,
-    "big_small_accuracy": 0.4976,
-    "sum_range_accuracy": 0.2152
+    "combination_accuracy": 0.144,
+    "big_small_accuracy": 0.504,
+    "sum_range_accuracy": 0.2154
   },
   "target_comparison": {
     "combination_target": "56-61%",
@@ -18,15 +18,15 @@
     "markov_model": {
       "current_ema_alpha": 0.9,
       "accuracy_samples": 100,
-      "avg_accuracy": 0.1423,
+      "avg_accuracy": 0.1439,
       "ema_stability": "stable",
       "ema_variance": 0.0,
       "adjustment_range": "0.1-0.9"
     },
     "tail_analyzer": {
       "accuracy_samples": 100,
-      "avg_accuracy": 0.5616,
-      "current_boost_factor": 1.03,
+      "avg_accuracy": 0.5373,
+      "current_boost_factor": 1.05,
       "boost_factor_range": "1.01-1.07",
       "target_tails": [
         7,
