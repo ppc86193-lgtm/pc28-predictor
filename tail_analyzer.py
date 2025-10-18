@@ -6,6 +6,13 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Constants for better maintainability
+EXPECTED_TAIL_FREQUENCY = 0.1  # 10% uniform distribution
+SIGNIFICANCE_THRESHOLD = 0.05
+HIGH_FREQUENCY_THRESHOLD = 0.15
+VARIANCE_SCALE_FACTOR = 10
+MIN_SAMPLE_SIZE = 10
+
 def analyze_tail_frequency(features: List[Dict[str, Any]], window: int = 16) -> Tuple[Dict[int, float], float]:
     """
     Analyze tail frequency distribution and perform chi-square test
@@ -17,9 +24,15 @@ def analyze_tail_frequency(features: List[Dict[str, Any]], window: int = 16) -> 
     Returns:
         Tuple of (tail_frequencies, p_value)
     """
+    # Input validation
+    if window <= 0:
+        raise ValueError("Window size must be positive")
+    if window > 1000:
+        logger.warning(f"Large window size {window} may impact performance")
+    
     if not features or len(features) < window:
         logger.warning(f"Insufficient data for tail analysis: {len(features) if features else 0} < {window}")
-        return {i: 0.1 for i in range(10)}, 1.0
+        return {i: EXPECTED_TAIL_FREQUENCY for i in range(10)}, 1.0
     
     # Extract tails from the most recent window
     recent_features = features[-window:]
@@ -36,16 +49,21 @@ def analyze_tail_frequency(features: List[Dict[str, Any]], window: int = 16) -> 
     
     if not tails:
         logger.warning("No valid tail data found")
-        return {i: 0.1 for i in range(10)}, 1.0
+        return {i: EXPECTED_TAIL_FREQUENCY for i in range(10)}, 1.0
+    
+    # Check minimum sample size for statistical validity
+    if len(tails) < MIN_SAMPLE_SIZE:
+        logger.warning(f"Sample size {len(tails)} below minimum {MIN_SAMPLE_SIZE} for reliable statistics")
+        return {i: EXPECTED_TAIL_FREQUENCY for i in range(10)}, 1.0
     
     # Count tail frequencies
     tail_counts = Counter(tails)
     total_count = len(tails)
     
     # Calculate frequency distribution
-    freq_dist = {}
+    tail_frequencies = {}
     for i in range(10):
-        freq_dist[i] = tail_counts.get(i, 0) / total_count
+        tail_frequencies[i] = tail_counts.get(i, 0) / total_count
     
     # Prepare data for chi-square test
     observed = [tail_counts.get(i, 0) for i in range(10)]
@@ -64,12 +82,12 @@ def analyze_tail_frequency(features: List[Dict[str, Any]], window: int = 16) -> 
         chi2_stat, p_value = 0.0, 1.0
     
     # Log significant deviations
-    if p_value < 0.05:
-        significant_tails = [i for i in range(10) if freq_dist[i] > 0.15]
+    if p_value < SIGNIFICANCE_THRESHOLD:
+        significant_tails = [i for i in range(10) if tail_frequencies[i] > HIGH_FREQUENCY_THRESHOLD]
         if significant_tails:
             logger.info(f"Significant tail deviations detected: {significant_tails}")
     
-    return freq_dist, p_value
+    return tail_frequencies, p_value
 
 def adjust_probs_by_tail(probs: Dict[str, float], 
                         tail_freq: Dict[int, float], 
@@ -116,7 +134,7 @@ def adjust_probs_by_tail(probs: Dict[str, float],
     high_even_tails = [0, 2, 8]
     
     for tail in high_odd_tails:
-        if tail_freq.get(tail, 0) > 0.15:  # Significantly higher than expected 10%
+        if tail_freq.get(tail, 0) > HIGH_FREQUENCY_THRESHOLD:
             if "大单" in adjusted_probs:
                 adjusted_probs["大单"] += tail_factor
             if "小单" in adjusted_probs:
@@ -124,7 +142,7 @@ def adjust_probs_by_tail(probs: Dict[str, float],
             logger.debug(f"Tail {tail} adjustment: +{tail_factor} to odd combinations")
     
     for tail in high_even_tails:
-        if tail_freq.get(tail, 0) > 0.15:
+        if tail_freq.get(tail, 0) > HIGH_FREQUENCY_THRESHOLD:
             if "小双" in adjusted_probs:
                 adjusted_probs["小双"] += tail_factor
             if "大双" in adjusted_probs:
@@ -135,6 +153,10 @@ def adjust_probs_by_tail(probs: Dict[str, float],
     total = sum(adjusted_probs.values())
     if total > 0:
         adjusted_probs = {k: v / total for k, v in adjusted_probs.items()}
+    else:
+        # Fallback for zero total
+        logger.warning("Total probability is zero, returning uniform distribution")
+        adjusted_probs = {k: 1.0/len(adjusted_probs) for k in adjusted_probs.keys()}
     
     return adjusted_probs
 
@@ -153,23 +175,23 @@ def calculate_tail_statistics(features: List[Dict[str, Any]],
     stats = {}
     
     for window in window_sizes:
-        freq_dist, p_value = analyze_tail_frequency(features, window)
+        tail_frequencies, p_value = analyze_tail_frequency(features, window)
         
         # Calculate additional statistics
-        if freq_dist:
-            frequencies = list(freq_dist.values())
-            variance = np.var(frequencies)
-            max_freq = max(frequencies)
-            min_freq = min(frequencies)
+        if tail_frequencies:
+            frequency_values = list(tail_frequencies.values())
+            variance = np.var(frequency_values)
+            max_freq = max(frequency_values)
+            min_freq = min(frequency_values)
             
             stats[f"window_{window}"] = {
-                "frequencies": freq_dist,
+                "frequencies": tail_frequencies,
                 "p_value": p_value,
                 "variance": variance,
                 "max_frequency": max_freq,
                 "min_frequency": min_freq,
-                "is_significant": p_value < 0.05,
-                "deviation_score": variance * 10  # Scaled deviation score
+                "is_significant": p_value < SIGNIFICANCE_THRESHOLD,
+                "deviation_score": variance * VARIANCE_SCALE_FACTOR
             }
     
     return stats
@@ -196,11 +218,11 @@ def get_tail_prediction_weights(tail_stats: Dict[str, Any]) -> Dict[str, float]:
     primary_window = min(tail_stats.keys()) if tail_stats else None
     
     if primary_window and tail_stats[primary_window]["is_significant"]:
-        freq_dist = tail_stats[primary_window]["frequencies"]
+        tail_frequencies = tail_stats[primary_window]["frequencies"]
         
         # Adjust weights based on significant tail patterns
-        for tail, freq in freq_dist.items():
-            if freq > 0.15:  # Significantly above expected 10%
+        for tail, freq in tail_frequencies.items():
+            if freq > HIGH_FREQUENCY_THRESHOLD:
                 if tail in [1, 3, 5, 7, 9]:  # Odd tails
                     weights["大单"] += 0.02
                     weights["小单"] += 0.01
