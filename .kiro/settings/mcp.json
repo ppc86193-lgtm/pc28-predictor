@@ -1,15 +1,8 @@
-# mcp.json
 {
-  "servers": [
-    {
-      "name": "aws-docs",
-      "url": "https://aws-docs-mcp-server",
-      "token": "[REDACTED]"
-    },
-    {
-      "name": "gitlab-mcp",
-      "url": "https://gitlab-mcp-server",
-      "token": "[REDACTED]"
+  "mcpServers": {
+    "github": {
+      "command": "bash",
+      "args": ["-c", "GITHUB_PERSONAL_ACCESS_TOKEN=$(gh auth token) npx -y @modelcontextprotocol/server-github"]
     }
-  ]
+  }
 }
