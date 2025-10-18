@@ -6,7 +6,8 @@ import logging
 from pydantic import BaseModel, Field, ValidationError, conint
 from typing import List, Dict, Any, Literal, Optional
 from datetime import datetime
-from config import api_key_aimlapi, api_key_data, app_id, real_time_url, history_url, aimlapi_base
+from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
+from config import api_key_aimlapi, api_key_data, app_id, real_time_url, history_url, aimlapi_base, redis_client
 
 logger = logging.getLogger(__name__)
 
@@ -141,9 +142,11 @@ def generate_sign(params: Dict[str, str]) -> str:
     sorted_params = ''.join(f"{k}{v}" for k, v in sorted(params.items()) if v) + api_key_data
     return hashlib.md5(sorted_params.encode()).hexdigest()
 
+@retry(stop=stop_after_attempt(3), wait=wait_fixed(1), retry=retry_if_exception_type(requests.RequestException))
 def fetch_realtime_data() -> Dict[str, Any]:
-    """Fetch real-time PC28 lottery data"""
+    """Fetch real-time PC28 lottery data with retry mechanism"""
     try:
+        start_time = time.time()
         timestamp = str(int(time.time()))
         params = {"appid": app_id, "format": "json", "time": timestamp}
         params["sign"] = generate_sign(params)
@@ -152,7 +155,8 @@ def fetch_realtime_data() -> Dict[str, Any]:
         response.raise_for_status()
         
         data = response.json()
-        logger.info("Successfully fetched real-time PC28 data")
+        elapsed_time = time.time() - start_time
+        logger.info(f"Successfully fetched real-time PC28 data in {elapsed_time:.2f}s")
         return data
         
     except requests.exceptions.Timeout as e:
@@ -165,14 +169,19 @@ def fetch_realtime_data() -> Dict[str, Any]:
                            "PC28_HTTP_ERROR", {"status_code": e.response.status_code})
         log_error("pc28_api", error)
         raise error
+    except requests.exceptions.RequestException as e:
+        # Re-raise RequestException for retry mechanism
+        raise e
     except Exception as e:
         error = PC28APIError(f"Real-time API error: {str(e)}", "PC28_GENERAL_ERROR")
         log_error("pc28_api", error)
         raise error
 
+@retry(stop=stop_after_attempt(3), wait=wait_fixed(1), retry=retry_if_exception_type(requests.RequestException))
 def fetch_history_data(date: str, limit: int = 1000) -> Dict[str, Any]:
-    """Fetch historical PC28 lottery data"""
+    """Fetch historical PC28 lottery data with retry mechanism"""
     try:
+        start_time = time.time()
         params = {"appid": app_id, "date": date, "limit": str(limit), "format": "json"}
         params["sign"] = generate_sign(params)
         
@@ -180,7 +189,8 @@ def fetch_history_data(date: str, limit: int = 1000) -> Dict[str, Any]:
         response.raise_for_status()
         
         data = response.json()
-        logger.info(f"Successfully fetched {limit} historical records for {date}")
+        elapsed_time = time.time() - start_time
+        logger.info(f"Successfully fetched {limit} historical records for {date} in {elapsed_time:.2f}s")
         return data
         
     except requests.exceptions.Timeout as e:
@@ -193,36 +203,63 @@ def fetch_history_data(date: str, limit: int = 1000) -> Dict[str, Any]:
                            "PC28_HTTP_ERROR", {"status_code": e.response.status_code, "date": date})
         log_error("pc28_api", error)
         raise error
+    except requests.exceptions.RequestException as e:
+        # Re-raise RequestException for retry mechanism
+        raise e
     except Exception as e:
         error = PC28APIError(f"History API error: {str(e)}", "PC28_GENERAL_ERROR", {"date": date})
         log_error("pc28_api", error)
         raise error
 
+@retry(stop=stop_after_attempt(3), wait=wait_fixed(1), retry=retry_if_exception_type(requests.RequestException))
 def get_model_list() -> Dict[str, Any]:
-    """Fetch AI/ML model list from external API"""
+    """Fetch AI/ML model list from external API with Redis caching"""
+    cache_key = "pc28_models"
+    
+    # Try to get from cache first
     try:
+        cached_data = redis_client.get(cache_key)
+        if cached_data:
+            logger.info("Model list retrieved from Redis cache")
+            return json.loads(cached_data)
+    except Exception as e:
+        logger.warning(f"Redis cache read failed: {e}")
+    
+    # Fetch from API if not in cache
+    try:
+        start_time = time.time()
         headers = {"Authorization": f"Bearer {api_key_aimlapi}"}
-        response = requests.get(f"{aimlapi_base}/models", headers=headers, timeout=10)
+        response = requests.get(f"{aimlapi_base}/models", headers=headers, timeout=5)
         response.raise_for_status()
         
         data = response.json()
-        logger.info("Successfully fetched AI/ML model list")
+        elapsed_time = time.time() - start_time
+        logger.info(f"Successfully fetched AI/ML model list in {elapsed_time:.2f}s")
+        
+        # Cache the result for 5 minutes (300 seconds)
+        try:
+            redis_client.setex(cache_key, 300, json.dumps(data))
+            logger.info("Model list cached in Redis for 300 seconds")
+        except Exception as e:
+            logger.warning(f"Redis cache write failed: {e}")
+        
         return data
         
     except requests.exceptions.Timeout as e:
         error = AIMLAPIError("AI/ML API request timeout", "AIML_TIMEOUT", 
-                           {"url": f"{aimlapi_base}/models", "timeout": 10})
+                           {"url": f"{aimlapi_base}/models", "timeout": 5})
         log_error("aiml_api", error)
-        raise error
+        # Return empty list on error to prevent system failure
+        return {"object": "list", "data": []}
     except requests.exceptions.HTTPError as e:
         error = AIMLAPIError(f"AI/ML API HTTP error: {e.response.status_code}", 
                            "AIML_HTTP_ERROR", {"status_code": e.response.status_code})
         log_error("aiml_api", error)
-        raise error
+        return {"object": "list", "data": []}
     except Exception as e:
         error = AIMLAPIError(f"AI/ML API error: {str(e)}", "AIML_GENERAL_ERROR")
         log_error("aiml_api", error)
-        raise error
+        return {"object": "list", "data": []}
 
 def extract_features(data: Dict[str, Any]) -> List[PC28Data]:
     """Extract and validate PC28 features from API response data"""
@@ -247,7 +284,7 @@ def extract_features(data: Dict[str, Any]) -> List[PC28Data]:
             tail = sum_value % 10
             
             # Determine combination type
-            if sum_value in [0, 1, 2, 3, 4, 23, 24, 25, 26, 27]:
+            if sum_value <= 5 or sum_value >= 22:  # 0-5 极小, 22-27 极大
                 combination = "极值"
             else:
                 size = "大" if sum_value >= 14 else "小"
