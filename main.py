@@ -1,8 +1,11 @@
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Query
+from pydantic import BaseModel, Field
 import uvicorn
 import json
 import logging
+import time
 from datetime import datetime
+from typing import Optional
 from config import redis_client
 from api_client import (
     check_system_health, ErrorResponse, SystemHealth, 
@@ -10,17 +13,69 @@ from api_client import (
 )
 from data_processor import extract_features, translate_combination, get_cache_stats, clear_cache
 from prediction_engine import get_prediction_engine, PredictionConfig
+from monitor import get_monitor
+from optimizer import get_optimizer
+
+# Request/Response Models
+class AccuracyUpdateRequest(BaseModel):
+    predicted: str = Field(..., description="Predicted combination")
+    actual: str = Field(..., description="Actual combination")
+
+class StandardResponse(BaseModel):
+    status: str
+    message: str
 
 # Initialize FastAPI app
 app = FastAPI(
     title="PC28 Prediction System",
     description="AI/ML API Model Extraction and PC28 Prediction System",
-    version="1.0.0"
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc"
 )
+
+# Add security headers middleware
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    return response
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize system on startup"""
+    logger.info("PC28 Prediction System starting up...")
+    try:
+        # Test Redis connection
+        redis_client.ping()
+        logger.info("Redis connection established")
+        
+        # Initialize prediction engine
+        global prediction_engine
+        prediction_engine = get_prediction_engine()
+        logger.info("Prediction engine initialized")
+        
+    except Exception as e:
+        logger.error(f"Startup failed: {e}")
+        raise
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup on shutdown"""
+    logger.info("PC28 Prediction System shutting down...")
+    try:
+        # Cleanup prediction engine if needed
+        if 'prediction_engine' in globals():
+            prediction_engine.cleanup_old_data()
+        logger.info("Cleanup completed")
+    except Exception as e:
+        logger.warning(f"Shutdown cleanup warning: {e}")
 
 @app.get("/health")
 async def health_check():
@@ -69,18 +124,26 @@ async def root(request: Request):
     if lang.startswith("en"):
         return {
             "system": "PC28 Prediction System",
-            "phase": "5 - Prediction System Integration",
+            "phase": "6 - Monitoring and Optimization",
             "status": "Development",
-            "endpoints": ["/health", "/predict", "/models", "/data/realtime", "/data/history", "/stats", "/performance"],
-            "note": "Prediction engine integrated with real-time predictions"
+            "endpoints": [
+                "/health", "/predict", "/models", "/data/realtime", "/data/history", 
+                "/stats", "/performance", "/monitor/accuracy", "/monitor/performance", 
+                "/monitor/history", "/optimize/analyze", "/optimize/run"
+            ],
+            "note": "Monitoring and optimization system integrated with real-time performance tracking"
         }
     else:
         return {
             "system": "PC28预测系统",
-            "phase": "5 - 预测系统集成",
+            "phase": "6 - 监控与优化",
             "status": "开发中",
-            "endpoints": ["/health", "/predict", "/models", "/data/realtime", "/data/history", "/stats", "/performance"],
-            "note": "预测引擎已集成，支持实时预测"
+            "endpoints": [
+                "/health", "/predict", "/models", "/data/realtime", "/data/history", 
+                "/stats", "/performance", "/monitor/accuracy", "/monitor/performance", 
+                "/monitor/history", "/optimize/analyze", "/optimize/run"
+            ],
+            "note": "监控和优化系统已集成，支持实时性能跟踪和参数调优"
         }
 
 @app.get("/models")
@@ -149,7 +212,11 @@ async def get_realtime_data(request: Request):
         raise HTTPException(status_code=500, detail=error_msg)
 
 @app.get("/data/history")
-async def get_history_data(date: str, limit: int = 1000, request: Request = None):
+async def get_history_data(
+    date: str = Query(..., description="Date in YYYY-MM-DD format"),
+    limit: int = Query(1000, ge=1, le=10000, description="Number of records to retrieve"),
+    request: Request = None
+):
     """Get historical PC28 data"""
     lang = get_language(request)
     
@@ -187,17 +254,33 @@ async def get_history_data(date: str, limit: int = 1000, request: Request = None
         error_msg = f"Failed to fetch historical data: {e}" if lang.startswith("en") else f"获取历史数据失败: {e}"
         raise HTTPException(status_code=500, detail=error_msg)
 
-# Initialize prediction engine
-prediction_engine = get_prediction_engine()
+# Prediction engine will be initialized in startup event
+prediction_engine = None
 
 @app.post("/predict")
 async def generate_prediction(request: Request):
     """Generate PC28 prediction using integrated engine"""
+    if prediction_engine is None:
+        raise HTTPException(status_code=503, detail="Prediction engine not initialized")
+    
     lang = get_language(request)
+    start_time = time.time()
     
     try:
         # Generate prediction
         prediction = prediction_engine.generate_prediction()
+        
+        # Calculate response time
+        response_time_ms = (time.time() - start_time) * 1000
+        
+        # Record prediction for monitoring
+        monitor = get_monitor()
+        record_id = monitor.record_prediction(
+            predicted_combination=prediction.combination,
+            predicted_sum_range=prediction.sum_range,
+            confidence=prediction.confidence,
+            response_time_ms=response_time_ms
+        )
         
         # Translate combination if needed
         translated_combination = translate_combination(prediction.combination, lang)
@@ -215,9 +298,11 @@ async def generate_prediction(request: Request):
                     "combination": translated_combination,
                     "probabilities": translated_probs,
                     "confidence": round(prediction.confidence, 3),
-                    "timestamp": prediction.timestamp.isoformat()
+                    "timestamp": prediction.timestamp.isoformat(),
+                    "record_id": record_id
                 },
-                "message": f"Prediction generated with {prediction.confidence:.1%} confidence"
+                "message": f"Prediction generated with {prediction.confidence:.1%} confidence",
+                "response_time_ms": round(response_time_ms, 2)
             }
         else:
             return {
@@ -227,9 +312,11 @@ async def generate_prediction(request: Request):
                     "combination": translated_combination,
                     "probabilities": translated_probs,
                     "confidence": round(prediction.confidence, 3),
-                    "timestamp": prediction.timestamp.isoformat()
+                    "timestamp": prediction.timestamp.isoformat(),
+                    "record_id": record_id
                 },
-                "message": f"预测生成完成，置信度 {prediction.confidence:.1%}"
+                "message": f"预测生成完成，置信度 {prediction.confidence:.1%}",
+                "response_time_ms": round(response_time_ms, 2)
             }
             
     except Exception as e:
@@ -240,6 +327,17 @@ async def generate_prediction(request: Request):
 @app.post("/predict/update")
 async def update_prediction_accuracy(predicted: str, actual: str, request: Request):
     """Update prediction accuracy with actual result"""
+    if prediction_engine is None:
+        raise HTTPException(status_code=503, detail="Prediction engine not initialized")
+    
+    # Validate input parameters
+    valid_combinations = ["大单", "小双", "小单", "大双", "极值"]
+    if predicted not in valid_combinations or actual not in valid_combinations:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Invalid combination. Must be one of: {valid_combinations}"
+        )
+    
     lang = get_language(request)
     
     try:
@@ -307,6 +405,9 @@ async def get_statistics(request: Request):
 @app.get("/performance")
 async def get_performance_metrics(request: Request):
     """Get prediction performance metrics"""
+    if prediction_engine is None:
+        raise HTTPException(status_code=503, detail="Prediction engine not initialized")
+    
     lang = get_language(request)
     
     try:
@@ -328,6 +429,126 @@ async def get_performance_metrics(request: Request):
     except Exception as e:
         logger.error(f"Performance metrics failed: {e}")
         error_msg = f"Performance metrics failed: {e}" if lang.startswith("en") else f"性能指标获取失败: {e}"
+        raise HTTPException(status_code=500, detail=error_msg)
+
+@app.post("/predict/result")
+async def update_prediction_result(
+    record_id: str,
+    actual_combination: str,
+    actual_sum: int = Query(..., ge=0, le=27, description="Actual sum (0-27)"),
+    request: Request = None
+):
+    """Update prediction result with actual outcome"""
+    lang = get_language(request)
+    
+    try:
+        monitor = get_monitor()
+        success = monitor.update_prediction_result(record_id, actual_combination, actual_sum)
+        
+        if not success:
+            raise ValueError("Failed to update prediction result")
+        
+        if lang.startswith("en"):
+            return {
+                "status": "success",
+                "message": f"Prediction result updated for {record_id}"
+            }
+        else:
+            return {
+                "status": "成功",
+                "message": f"预测结果已更新: {record_id}"
+            }
+            
+    except Exception as e:
+        logger.error(f"Failed to update prediction result: {e}")
+        error_msg = f"Update failed: {e}" if lang.startswith("en") else f"更新失败: {e}"
+        raise HTTPException(status_code=500, detail=error_msg)
+
+@app.get("/monitor/accuracy")
+async def get_accuracy_metrics(
+    period: str = Query("24h", regex="^(1h|24h|7d)$", description="Time period"),
+    request: Request = None
+):
+    """Get prediction accuracy metrics"""
+    lang = get_language(request)
+    
+    try:
+        monitor = get_monitor()
+        metrics = monitor.get_accuracy_metrics(period)
+        
+        if lang.startswith("en"):
+            return {
+                "status": "success",
+                "metrics": metrics,
+                "message": f"Accuracy metrics for {period}"
+            }
+        else:
+            return {
+                "status": "成功",
+                "metrics": metrics,
+                "message": f"{period} 准确率指标"
+            }
+            
+    except Exception as e:
+        logger.error(f"Failed to get accuracy metrics: {e}")
+        error_msg = f"Metrics failed: {e}" if lang.startswith("en") else f"指标获取失败: {e}"
+        raise HTTPException(status_code=500, detail=error_msg)
+
+@app.get("/monitor/performance")
+async def get_system_performance(request: Request):
+    """Get system performance metrics"""
+    lang = get_language(request)
+    
+    try:
+        monitor = get_monitor()
+        metrics = monitor.get_performance_metrics()
+        
+        if lang.startswith("en"):
+            return {
+                "status": "success",
+                "performance": metrics,
+                "message": "System performance metrics"
+            }
+        else:
+            return {
+                "status": "成功",
+                "performance": metrics,
+                "message": "系统性能指标"
+            }
+            
+    except Exception as e:
+        logger.error(f"Failed to get performance metrics: {e}")
+        error_msg = f"Performance metrics failed: {e}" if lang.startswith("en") else f"性能指标获取失败: {e}"
+        raise HTTPException(status_code=500, detail=error_msg)
+
+@app.get("/monitor/history")
+async def get_prediction_history(
+    limit: int = Query(50, ge=1, le=1000, description="Number of records"),
+    request: Request = None
+):
+    """Get prediction history"""
+    lang = get_language(request)
+    
+    try:
+        monitor = get_monitor()
+        history = monitor.get_prediction_history(limit)
+        
+        if lang.startswith("en"):
+            return {
+                "status": "success",
+                "history": history,
+                "message": f"Retrieved {len(history)} prediction records"
+            }
+        else:
+            return {
+                "status": "成功",
+                "history": history,
+                "message": f"获取到 {len(history)} 条预测记录"
+            }
+            
+    except Exception as e:
+        logger.error(f"Failed to get prediction history: {e}")
+        error_msg = f"History failed: {e}" if lang.startswith("en") else f"历史记录获取失败: {e}"
         raise HTTPException(status_code=500, detail=error_msg)
 
 @app.delete("/cache")
@@ -354,6 +575,117 @@ async def clear_system_cache(pattern: str = None, request: Request = None):
     except Exception as e:
         logger.error(f"Cache clearing failed: {e}")
         error_msg = f"Cache clearing failed: {e}" if lang.startswith("en") else f"缓存清理失败: {e}"
+        raise HTTPException(status_code=500, detail=error_msg)
+
+@app.get("/optimize/analyze")
+async def analyze_performance(request: Request):
+    """Analyze system performance for optimization"""
+    lang = get_language(request)
+    
+    try:
+        optimizer = get_optimizer()
+        analysis = optimizer.analyze_performance()
+        
+        if lang.startswith("en"):
+            return {
+                "status": "success",
+                "analysis": analysis,
+                "message": "Performance analysis completed"
+            }
+        else:
+            return {
+                "status": "成功",
+                "analysis": analysis,
+                "message": "性能分析完成"
+            }
+            
+    except Exception as e:
+        logger.error(f"Performance analysis failed: {e}")
+        error_msg = f"Analysis failed: {e}" if lang.startswith("en") else f"分析失败: {e}"
+        raise HTTPException(status_code=500, detail=error_msg)
+
+@app.post("/optimize/run")
+async def run_optimization(request: Request):
+    """Run optimization cycle"""
+    lang = get_language(request)
+    
+    try:
+        optimizer = get_optimizer()
+        result = optimizer.run_optimization_cycle()
+        
+        if lang.startswith("en"):
+            return {
+                "status": "success",
+                "optimization": result,
+                "message": "Optimization cycle completed"
+            }
+        else:
+            return {
+                "status": "成功",
+                "optimization": result,
+                "message": "优化周期完成"
+            }
+            
+    except Exception as e:
+        logger.error(f"Optimization failed: {e}")
+        error_msg = f"Optimization failed: {e}" if lang.startswith("en") else f"优化失败: {e}"
+        raise HTTPException(status_code=500, detail=error_msg)
+
+@app.get("/optimize/parameters")
+async def get_optimization_parameters(request: Request):
+    """Get current optimization parameters"""
+    lang = get_language(request)
+    
+    try:
+        optimizer = get_optimizer()
+        parameters = optimizer.get_current_parameters()
+        
+        if lang.startswith("en"):
+            return {
+                "status": "success",
+                "parameters": parameters,
+                "message": "Current optimization parameters"
+            }
+        else:
+            return {
+                "status": "成功",
+                "parameters": parameters,
+                "message": "当前优化参数"
+            }
+            
+    except Exception as e:
+        logger.error(f"Failed to get parameters: {e}")
+        error_msg = f"Parameters failed: {e}" if lang.startswith("en") else f"参数获取失败: {e}"
+        raise HTTPException(status_code=500, detail=error_msg)
+
+@app.get("/optimize/history")
+async def get_optimization_history(
+    days: int = Query(7, ge=1, le=30, description="Number of days"),
+    request: Request = None
+):
+    """Get optimization history"""
+    lang = get_language(request)
+    
+    try:
+        optimizer = get_optimizer()
+        history = optimizer.get_optimization_history(days)
+        
+        if lang.startswith("en"):
+            return {
+                "status": "success",
+                "history": history,
+                "message": f"Optimization history for {days} days"
+            }
+        else:
+            return {
+                "status": "成功",
+                "history": history,
+                "message": f"{days} 天优化历史"
+            }
+            
+    except Exception as e:
+        logger.error(f"Failed to get optimization history: {e}")
+        error_msg = f"History failed: {e}" if lang.startswith("en") else f"历史记录获取失败: {e}"
         raise HTTPException(status_code=500, detail=error_msg)
 
 if __name__ == "__main__":
