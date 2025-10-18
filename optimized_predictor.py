@@ -6,17 +6,34 @@
 
 import numpy as np
 from collections import Counter, deque
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Any
 import logging
 
 logger = logging.getLogger(__name__)
+
+# Configuration constants
+HISTORY_WINDOW = 200
+TAIL_ANALYSIS_WINDOW = 50
+SUM_ANALYSIS_WINDOW = 100
+PERIODICITY_WINDOW = 60
+
+# Threshold constants
+ODD_RATIO_THRESHOLD = 0.55
+CONSECUTIVE_RATE_THRESHOLD = 0.3
+REPEAT_RATE_THRESHOLD = 0.2
+
+# Adjustment factors
+ODD_BOOST_FACTOR = 1.3
+ODD_REDUCE_FACTOR = 0.8
+CONSECUTIVE_BOOST = 1.2
+REPEAT_PENALTY = 0.7
 
 class OptimizedPC28Predictor:
     """优化的PC28预测器"""
     
     def __init__(self):
-        self.history_window = 200  # 历史窗口
-        self.pattern_cache = {}
+        self.history_window = HISTORY_WINDOW
+        # Note: pattern_cache removed as it was unused
         
     def predict(self, historical_data: List[Dict]) -> Dict:
         """
@@ -47,30 +64,63 @@ class OptimizedPC28Predictor:
         periodicity = self._detect_periodicity(recent)
         
         # 5. 综合预测
-        prediction = self._综合预测(
+        prediction = self._综合_predictions(
             combo_freq, tail_pattern, sum_distribution, periodicity
         )
         
         return prediction
     
-    def _analyze_combination_frequency(self, data: List[Dict]) -> Dict[str, float]:
-        """分析组合频率"""
-        combos = [d['combination'] for d in data]
-        counter = Counter(combos)
-        total = len(combos)
+    def _analyze_combination_frequency(self, data: List[Dict[str, Any]]) -> Dict[str, float]:
+        """分析组合频率
         
-        # 计算频率并应用平滑
-        freq = {}
-        for combo in ['大单', '小双', '小单', '大双', '极值']:
-            count = counter.get(combo, 0)
-            # 拉普拉斯平滑
-            freq[combo] = (count + 1) / (total + 5)
-        
-        return freq
+        Args:
+            data: 历史数据列表
+            
+        Returns:
+            各组合的频率字典，已应用拉普拉斯平滑
+        """
+        try:
+            combos = [d.get('combination', '') for d in data if isinstance(d, dict)]
+            if not combos:
+                logger.warning("No valid combinations found in data")
+                return {combo: 0.2 for combo in ['大单', '小双', '小单', '大双', '极值']}
+            
+            counter = Counter(combos)
+            total = len(combos)
+            
+            # 计算频率并应用拉普拉斯平滑
+            freq = {}
+            for combo in ['大单', '小双', '小单', '大双', '极值']:
+                count = counter.get(combo, 0)
+                # 拉普拉斯平滑
+                freq[combo] = (count + 1) / (total + 5)
+            
+            return freq
+        except Exception as e:
+            logger.error(f"Error analyzing combination frequency: {e}")
+            return {combo: 0.2 for combo in ['大单', '小双', '小单', '大双', '极值']}
     
-    def _analyze_tail_pattern(self, data: List[Dict]) -> Dict:
-        """分析尾数模式"""
-        tails = [d['tail'] for d in data[-50:]]  # 最近50条
+    def _analyze_tail_pattern(self, data: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """分析尾数模式
+        
+        Args:
+            data: 历史数据列表
+            
+        Returns:
+            尾数模式分析结果，包含频率、连号率、重复率等
+        """
+        try:
+            tails = [d.get('tail', 0) for d in data[-TAIL_ANALYSIS_WINDOW:] 
+                    if isinstance(d, dict) and 'tail' in d]
+            
+            if len(tails) < 2:
+                logger.warning("Insufficient tail data for pattern analysis")
+                return self._default_tail_pattern()
+        except Exception as e:
+            logger.error(f"Error analyzing tail pattern: {e}")
+            return self._default_tail_pattern()
+        
+        # 最近50条
         
         # 尾数频率
         tail_freq = Counter(tails)
@@ -96,9 +146,25 @@ class OptimizedPC28Predictor:
             'even_ratio': even_count / len(tails)
         }
     
-    def _analyze_sum_distribution(self, data: List[Dict]) -> Dict:
-        """分析和值分布"""
-        sums = [d['sum'] for d in data[-100:]]
+    def _analyze_sum_distribution(self, data: List[Dict[str, Any]]) -> Dict[str, float]:
+        """分析和值分布
+        
+        Args:
+            data: 历史数据列表
+            
+        Returns:
+            和值范围分布字典
+        """
+        try:
+            sums = [d.get('sum', 14) for d in data[-SUM_ANALYSIS_WINDOW:] 
+                   if isinstance(d, dict) and 'sum' in d]
+            
+            if not sums:
+                logger.warning("No valid sum data found")
+                return {k: 1/6 for k in ['0-5', '6-9', '10-13', '14-17', '18-21', '22-27']}
+        except Exception as e:
+            logger.error(f"Error analyzing sum distribution: {e}")
+            return {k: 1/6 for k in ['0-5', '6-9', '10-13', '14-17', '18-21', '22-27']}
         
         # 分段统计
         ranges = {
@@ -113,9 +179,25 @@ class OptimizedPC28Predictor:
         total = len(sums)
         return {k: v/total for k, v in ranges.items()}
     
-    def _detect_periodicity(self, data: List[Dict]) -> Dict:
-        """检测周期性模式"""
-        combos = [d['combination'] for d in data[-60:]]
+    def _detect_periodicity(self, data: List[Dict[str, Any]]) -> Dict[str, float]:
+        """检测周期性模式
+        
+        Args:
+            data: 历史数据列表
+            
+        Returns:
+            周期性检测结果字典
+        """
+        try:
+            combos = [d.get('combination', '') for d in data[-PERIODICITY_WINDOW:] 
+                     if isinstance(d, dict) and 'combination' in d]
+            
+            if len(combos) < 15:
+                logger.warning("Insufficient data for periodicity detection")
+                return {}
+        except Exception as e:
+            logger.error(f"Error detecting periodicity: {e}")
+            return {}
         
         # 检测3期、5期、7期周期
         patterns = {}
@@ -144,34 +226,47 @@ class OptimizedPC28Predictor:
                      if last[i] == prev[i])
         return matches / max(len(last), len(prev))
     
-    def _综合预测(self, combo_freq, tail_pattern, sum_dist, periodicity) -> Dict:
-        """综合各种分析进行预测"""
+    def _综合_predictions(self, combo_freq: Dict[str, float], 
+                         tail_pattern: Dict[str, Any], 
+                         sum_dist: Dict[str, float], 
+                         periodicity: Dict[str, float]) -> Dict[str, Any]:
+        """综合各种分析进行预测
+        
+        Args:
+            combo_freq: 组合频率分布
+            tail_pattern: 尾数模式分析
+            sum_dist: 和值分布
+            periodicity: 周期性检测结果
+            
+        Returns:
+            综合预测结果
+        """
         
         # 基础概率（来自历史频率）
         probs = combo_freq.copy()
         
         # 根据尾数模式调整
-        if tail_pattern['odd_ratio'] > 0.55:
+        if tail_pattern.get('odd_ratio', 0.5) > ODD_RATIO_THRESHOLD:
             # 奇数尾多，增强单的概率
-            probs['大单'] *= 1.3
-            probs['小单'] *= 1.3
-            probs['大双'] *= 0.8
-            probs['小双'] *= 0.8
-        elif tail_pattern['even_ratio'] > 0.55:
+            probs['大单'] *= ODD_BOOST_FACTOR
+            probs['小单'] *= ODD_BOOST_FACTOR
+            probs['大双'] *= ODD_REDUCE_FACTOR
+            probs['小双'] *= ODD_REDUCE_FACTOR
+        elif tail_pattern.get('even_ratio', 0.5) > ODD_RATIO_THRESHOLD:
             # 偶数尾多，增强双的概率
-            probs['大双'] *= 1.3
-            probs['小双'] *= 1.3
-            probs['大单'] *= 0.8
-            probs['小单'] *= 0.8
+            probs['大双'] *= ODD_BOOST_FACTOR
+            probs['小双'] *= ODD_BOOST_FACTOR
+            probs['大单'] *= ODD_REDUCE_FACTOR
+            probs['小单'] *= ODD_REDUCE_FACTOR
         
         # 连号调整
-        if tail_pattern['consecutive_rate'] > 0.3:
-            probs['小双'] *= 1.2
-            probs['小单'] *= 1.2
+        if tail_pattern.get('consecutive_rate', 0) > CONSECUTIVE_RATE_THRESHOLD:
+            probs['小双'] *= CONSECUTIVE_BOOST
+            probs['小单'] *= CONSECUTIVE_BOOST
         
         # 重复调整
-        if tail_pattern['repeat_rate'] > 0.2:
-            probs['极值'] *= 0.7
+        if tail_pattern.get('repeat_rate', 0) > REPEAT_RATE_THRESHOLD:
+            probs['极值'] *= REPEAT_PENALTY
         
         # 归一化
         total = sum(probs.values())
@@ -210,8 +305,12 @@ class OptimizedPC28Predictor:
         else:
             return '10-17'
     
-    def _default_prediction(self) -> Dict:
-        """默认预测"""
+    def _default_prediction(self) -> Dict[str, Any]:
+        """默认预测（数据不足时使用）
+        
+        Returns:
+            默认预测结果，均匀分布
+        """
         return {
             'combination': '大单',
             'sum_range': '14-21',
@@ -223,6 +322,20 @@ class OptimizedPC28Predictor:
                 '大双': 0.25,
                 '极值': 0.0
             }
+        }
+    
+    def _default_tail_pattern(self) -> Dict[str, Any]:
+        """默认尾数模式（数据不足时使用）
+        
+        Returns:
+            默认尾数模式，中性值
+        """
+        return {
+            'freq': Counter(),
+            'consecutive_rate': 0.0,
+            'repeat_rate': 0.0,
+            'odd_ratio': 0.5,
+            'even_ratio': 0.5
         }
 
 
