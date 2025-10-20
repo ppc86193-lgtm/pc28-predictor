@@ -1,94 +1,122 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Configuration management for PC28 Prediction System.
-
-This module handles:
-- Loading configuration from config.json
-- Setting up Redis client with fallback to MockRedis
-- Environment variable support for Docker deployments
+🧠 伪随机心理学分析系统 - 配置文件
 """
 
-import json
-import redis
 import os
-import logging
-from typing import Dict, Any, Union
+from dataclasses import dataclass
+from typing import Dict, List
 
-# Configure logging
-logger = logging.getLogger(__name__)
+@dataclass
+class SystemConfig:
+    """系统配置"""
+    
+    # 应用配置
+    APP_TITLE: str = "伪随机心理学分析系统"
+    APP_ICON: str = "🧠"
+    VERSION: str = "1.0.0"
+    
+    # 页面配置
+    PAGE_LAYOUT: str = "wide"
+    SIDEBAR_STATE: str = "expanded"
+    
+    # 分析参数
+    DEFAULT_MEMORY_WINDOW: int = 10
+    DEFAULT_REPAIR_WINDOW: int = 3
+    DEFAULT_CONFIDENCE_THRESHOLD: float = 0.75
+    
+    # 记忆半衰模型参数
+    MEMORY_DECAY_RATE: float = 0.7
+    STRONG_MEMORY_WINDOW: int = 3
+    FORGET_THRESHOLD: float = 0.1
+    
+    # 转折点检测参数
+    PRESSURE_THRESHOLD: float = 0.75
+    REVERSAL_CONFIDENCE: float = 0.8
+    LAG_DETECTION_WINDOW: int = 8
+    
+    # 错频陷阱参数
+    HUMAN_WINDOW: int = 5
+    AI_WINDOW: int = 50
+    FREQUENCY_GAP_THRESHOLD: float = 0.15
+    TRAP_DANGER_THRESHOLD: float = 0.6
+    
+    # 数据处理参数
+    MIN_DATA_LENGTH: int = 20
+    MAX_DATA_LENGTH: int = 1000
+    DATA_VALIDATION_RANGE: tuple = (0, 27)
+    
+    # 可视化配置
+    CHART_HEIGHT: int = 400
+    CHART_COLORS: Dict[str, str] = None
+    
+    # 文件路径
+    DATA_DIR: str = "data"
+    RESULTS_DIR: str = "results"
+    LOGS_DIR: str = "logs"
+    
+    # 缓存配置
+    ENABLE_CACHE: bool = True
+    CACHE_TTL: int = 3600  # 1小时
+    
+    def __post_init__(self):
+        """初始化后处理"""
+        if self.CHART_COLORS is None:
+            self.CHART_COLORS = {
+                'big': '#FF6B6B',      # 红色 - 大
+                'small': '#4ECDC4',    # 蓝绿色 - 小
+                'odd': '#45B7D1',      # 蓝色 - 单
+                'even': '#96CEB4',     # 绿色 - 双
+                'turning_point': '#FECA57',  # 黄色 - 转折点
+                'memory_weight': '#A8E6CF',  # 浅绿 - 记忆权重
+                'pressure': '#FFB6C1',       # 粉色 - 压力
+                'trap': '#DDA0DD'            # 紫色 - 陷阱
+            }
+        
+        # 创建必要目录
+        for dir_path in [self.DATA_DIR, self.RESULTS_DIR, self.LOGS_DIR]:
+            os.makedirs(dir_path, exist_ok=True)
 
-# Load configuration
-config_path = os.path.join(os.path.dirname(__file__), 'config.json')
-try:
-    with open(config_path, 'r') as f:
-        config = json.load(f)
-except FileNotFoundError:
-    raise FileNotFoundError(f"Configuration file not found: {config_path}")
-except json.JSONDecodeError as e:
-    raise ValueError(f"Invalid JSON in configuration file: {e}")
+# 全局配置实例
+config = SystemConfig()
 
-# Validate required configuration keys
-required_keys = [
-    'api_key_aimlapi', 'api_key_data', 'app_id', 
-    'real_time_url', 'history_url', 'aimlapi_base'
-]
-missing_keys = [key for key in required_keys if key not in config]
-if missing_keys:
-    raise ValueError(f"Missing required configuration keys: {missing_keys}")
+# 主题配置
+STREAMLIT_THEME = {
+    "primaryColor": "#1f77b4",
+    "backgroundColor": "#ffffff", 
+    "secondaryBackgroundColor": "#f0f2f6",
+    "textColor": "#262730",
+    "font": "sans serif"
+}
 
-# API Configuration
-api_key_aimlapi = config['api_key_aimlapi']
-api_key_data = config['api_key_data']
-app_id = config['app_id']
-real_time_url = config['real_time_url']
-history_url = config['history_url']
-aimlapi_base = config['aimlapi_base']
+# 分析模式配置
+ANALYSIS_MODES = {
+    "快速模式": {
+        "memory_window": 8,
+        "repair_window": 2,
+        "confidence_threshold": 0.7,
+        "description": "快速分析，适合实时决策"
+    },
+    "标准模式": {
+        "memory_window": 10,
+        "repair_window": 3,
+        "confidence_threshold": 0.75,
+        "description": "平衡准确性和速度"
+    },
+    "深度模式": {
+        "memory_window": 15,
+        "repair_window": 5,
+        "confidence_threshold": 0.8,
+        "description": "深度分析，更高准确性"
+    }
+}
 
-# Redis Configuration - Use environment variables for Docker deployment
-redis_host = os.getenv('REDIS_HOST', config.get('redis_host', 'redis'))
-redis_port = int(os.getenv('REDIS_PORT', config.get('redis_port', 6379)))
-
-# Initialize Redis client with connection retry
-try:
-    redis_client = redis.Redis(
-        host=redis_host, 
-        port=redis_port, 
-        decode_responses=True,
-        socket_connect_timeout=5,
-        socket_timeout=5,
-        retry_on_timeout=True,
-        health_check_interval=30
-    )
-    # Test connection
-    redis_client.ping()
-    logger.info(f"Redis连接成功: {redis_host}:{redis_port}")
-except redis.ConnectionError as e:
-    logger.warning(f"Redis连接失败: {e}")
-    # 创建一个模拟的Redis客户端用于开发环境
-    class MockRedis:
-        def __init__(self):
-            self._data = {}
-        
-        def get(self, key):
-            return self._data.get(key)
-        
-        def set(self, key, value, ex=None):
-            self._data[key] = value
-            return True
-        
-        def delete(self, key):
-            return self._data.pop(key, None) is not None
-        
-        def exists(self, key):
-            return key in self._data
-        
-        def keys(self, pattern="*"):
-            if pattern == "*":
-                return list(self._data.keys())
-            # Simple pattern matching for basic cases
-            import fnmatch
-            return [k for k in self._data.keys() if fnmatch.fnmatch(k, pattern)]
-        
-        def ping(self):
-            return True
-    redis_client = MockRedis()
-    logger.info("使用模拟Redis客户端")
+# 系统状态
+SYSTEM_STATUS = {
+    "INITIALIZING": "🟡 系统初始化中",
+    "READY": "🟢 系统就绪",
+    "ANALYZING": "🔄 分析进行中", 
+    "ERROR": "🔴 系统错误",
+    "MAINTENANCE": "🟠 维护模式"
+}
